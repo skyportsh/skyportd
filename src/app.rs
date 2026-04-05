@@ -36,9 +36,7 @@ impl DaemonApp {
         tracker.spawn({
             let service = HeartbeatService::new(self.config.clone(), cancellation.child_token());
 
-            async move {
-                service.run().await.context("heartbeat service stopped")
-            }
+            async move { service.run().await.context("heartbeat service stopped") }
         });
 
         tracker.close();
@@ -58,11 +56,17 @@ impl DaemonApp {
         let shutdown_timeout = self.config.daemon.shutdown_timeout;
         match timeout(shutdown_timeout, tracker.wait()).await {
             Ok(_) => {
-                info!(timeout_seconds = shutdown_timeout.as_secs(), "daemon shutdown completed");
+                info!(
+                    timeout_seconds = shutdown_timeout.as_secs(),
+                    "daemon shutdown completed"
+                );
                 Ok(())
             }
             Err(_) => {
-                warn!(timeout_seconds = shutdown_timeout.as_secs(), "daemon shutdown timed out");
+                warn!(
+                    timeout_seconds = shutdown_timeout.as_secs(),
+                    "daemon shutdown timed out"
+                );
                 Ok(())
             }
         }

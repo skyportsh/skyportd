@@ -1,6 +1,6 @@
 use anyhow::Result;
-use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::UtcTime;
 
 use crate::config::{LogFormat, LoggingSection};
 
