@@ -9,6 +9,17 @@ use crate::config::DaemonConfig;
 use crate::service::HeartbeatService;
 use crate::shutdown;
 
+const ORANGE: &str = "\x1b[38;2;240;90;36m";
+const ORANGE_DARK: &str = "\x1b[38;2;217;36;0m";
+const GRAY: &str = "\x1b[38;2;120;120;120m";
+const RESET: &str = "\x1b[0m";
+const ASCII_ART: &str = r#"         __                          __      __
+   _____/ /____  ______  ____  _____/ /_____/ /
+  / ___/ //_/ / / / __ \/ __ \/ ___/ __/ __  / 
+ (__  ) ,< / /_/ / /_/ / /_/ / /  / /_/ /_/ /  
+/____/_/|_|\__, / .___/\____/_/   \__/\__,_/   
+          /____/_/"#;
+
 pub struct DaemonApp {
     config: DaemonConfig,
 }
@@ -22,6 +33,8 @@ impl DaemonApp {
         std::panic::set_hook(Box::new(|panic_info| {
             error!(details = %panic_info, "unhandled panic");
         }));
+
+        print_startup_banner();
 
         info!(
             daemon = %self.config.daemon.name,
@@ -71,4 +84,53 @@ impl DaemonApp {
             }
         }
     }
+}
+
+fn print_startup_banner() {
+    println!();
+
+    for line in ASCII_ART.lines() {
+        println!(
+            "{orange}{line}{reset}",
+            orange = ORANGE,
+            line = line,
+            reset = RESET
+        );
+    }
+
+    println!(
+        "{gray}              skyportd {orange_dark}{version}{reset}",
+        gray = GRAY,
+        orange_dark = ORANGE_DARK,
+        version = env!("CARGO_PKG_VERSION"),
+        reset = RESET,
+    );
+    println!(
+        "{gray}              Copyright © 2026 Skyport{reset}",
+        gray = GRAY,
+        reset = RESET,
+    );
+    println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_banner_includes_version_and_copyright() {
+        let banner = startup_banner_text();
+
+        assert!(banner.contains("skyportd"));
+        assert!(banner.contains(env!("CARGO_PKG_VERSION")));
+        assert!(banner.contains("Copyright © 2026 Skyport"));
+    }
+}
+
+fn startup_banner_text() -> String {
+    format!(
+        "{ascii}\nskyportd {version}\nCopyright © 2026 Skyport",
+        ascii = ASCII_ART,
+        version = env!("CARGO_PKG_VERSION"),
+    )
 }
