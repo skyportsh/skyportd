@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod configuration;
 mod logging;
 mod service;
 mod shutdown;
@@ -13,6 +14,8 @@ use crate::config::DaemonConfig;
 async fn main() -> Result<()> {
     let config = DaemonConfig::load()?;
     logging::init(&config.logging)?;
+
+    let config = configuration::ensure_configured(config).await?;
 
     let app = DaemonApp::new(config);
 
