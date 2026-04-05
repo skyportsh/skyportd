@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use tokio::select;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
+use crate::api::ApiService;
 use crate::config::DaemonConfig;
 use crate::service::HeartbeatService;
 use crate::shutdown;
@@ -45,11 +47,22 @@ impl DaemonApp {
 
         let cancellation = CancellationToken::new();
         let tracker = TaskTracker::new();
+        let (config_updates, config_rx) = watch::channel(self.config.clone());
 
         tracker.spawn({
-            let service = HeartbeatService::new(self.config.clone(), cancellation.child_token());
+            let service = HeartbeatService::new(
+                self.config.clone(),
+                config_updates.clone(),
+                cancellation.child_token(),
+            );
 
             async move { service.run().await.context("heartbeat service stopped") }
+        });
+
+        tracker.spawn({
+            let service = ApiService::new(config_rx, config_updates, cancellation.child_token());
+
+            async move { service.run().await.context("api service stopped") }
         });
 
         tracker.close();

@@ -6,9 +6,13 @@ rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0.98"
+axum = { version = "0.8.4", features = ["json"] }
+axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"] }
 config = { version = "0.15.22", default-features = false, features = ["toml"] }
 hostname = "0.4.1"
+http = "1.3.1"
 reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23.31", features = ["ring"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
 tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

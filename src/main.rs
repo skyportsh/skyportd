@@ -1,3 +1,4 @@
+mod api;
 mod app;
 mod config;
 mod configuration;
@@ -12,6 +13,10 @@ use crate::config::DaemonConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+
     let config = DaemonConfig::load()?;
     logging::init(&config.logging)?;
 

@@ -1,10 +1,11 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, NodeSection};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ORANGE: &str = "\x1b[38;2;240;90;36m";
@@ -40,6 +41,8 @@ struct DockerMetadata {
 
 #[derive(Debug, Deserialize)]
 struct ConfigurationResponse {
+    configuration: NodeSection,
+    daemon_callback_token: String,
     daemon_secret: String,
     daemon_uuid: String,
     heartbeat_interval_seconds: u64,
@@ -66,6 +69,7 @@ pub async fn ensure_configured(mut config: DaemonConfig) -> Result<DaemonConfig>
         .as_deref()
         .is_some_and(|secret| !secret.is_empty())
     {
+        ensure_node_runtime_configuration(&mut config)?;
         return Ok(config);
     }
 
@@ -84,12 +88,20 @@ pub async fn ensure_configured(mut config: DaemonConfig) -> Result<DaemonConfig>
                 config.persist_configuration(
                     payload.node_id,
                     &payload.daemon_secret,
+                    &payload.daemon_callback_token,
                     &payload.daemon_uuid,
                 )?;
                 config.panel.daemon_secret = Some(payload.daemon_secret);
+                config.panel.daemon_callback_token = Some(payload.daemon_callback_token);
                 config.panel.node_id = Some(payload.node_id);
                 config.panel.configuration_token = None;
                 config.daemon.uuid = payload.daemon_uuid;
+                config.node = Some(payload.configuration);
+                ensure_node_runtime_configuration(&mut config)?;
+
+                if let Some(node) = &config.node {
+                    config.persist_node_configuration(node)?;
+                }
 
                 info!(
                     node_id = payload.node_id,
@@ -115,6 +127,64 @@ pub async fn ensure_configured(mut config: DaemonConfig) -> Result<DaemonConfig>
             }
         }
     }
+}
+
+pub fn ensure_node_runtime_configuration(config: &mut DaemonConfig) -> Result<()> {
+    let Some(existing_node) = config.node.as_ref() else {
+        return Ok(());
+    };
+
+    if !existing_node.use_ssl {
+        return Ok(());
+    }
+
+    if has_existing_tls_paths(existing_node) {
+        return Ok(());
+    }
+
+    let fqdn = existing_node.fqdn.clone();
+    let default_cert = default_tls_cert_path(&fqdn);
+    let default_key = default_tls_key_path(&fqdn);
+
+    if path_exists(&default_cert) && path_exists(&default_key) {
+        if let Some(node) = config.node.as_mut() {
+            node.tls_cert_path = Some(default_cert.clone());
+            node.tls_key_path = Some(default_key.clone());
+        }
+        config.persist_node_tls_paths(&default_cert, &default_key)?;
+
+        info!(
+            cert_path = %default_cert,
+            key_path = %default_key,
+            fqdn = %fqdn,
+            "using letsencrypt tls certificate paths"
+        );
+
+        return Ok(());
+    }
+
+    ensure_interactive_terminal()?;
+    render_tls_banner(&fqdn, &default_cert, &default_key);
+
+    let cert_path = prompt_existing_path("TLS certificate path", Some(default_cert.as_str()))?;
+    let key_path = prompt_existing_path("TLS private key path", Some(default_key.as_str()))?;
+
+    if let Some(node) = config.node.as_mut() {
+        node.tls_cert_path = Some(cert_path.clone());
+        node.tls_key_path = Some(key_path.clone());
+    }
+    config.persist_node_tls_paths(&cert_path, &key_path)?;
+
+    println!();
+    println!(
+        "{orange}✓{reset} {gray}Saved TLS paths to {orange}config/local.toml{reset}",
+        orange = ORANGE,
+        gray = GRAY,
+        reset = RESET,
+    );
+    println!();
+
+    Ok(())
 }
 
 async fn enroll_with_panel(
@@ -251,6 +321,23 @@ fn has_bootstrap_values(config: &DaemonConfig) -> bool {
             .is_some_and(|token| !token.trim().is_empty())
 }
 
+fn has_existing_tls_paths(node: &NodeSection) -> bool {
+    node.tls_cert_path.as_deref().is_some_and(path_exists)
+        && node.tls_key_path.as_deref().is_some_and(path_exists)
+}
+
+fn default_tls_cert_path(fqdn: &str) -> String {
+    format!("/etc/letsencrypt/live/{fqdn}/fullchain.pem")
+}
+
+fn default_tls_key_path(fqdn: &str) -> String {
+    format!("/etc/letsencrypt/live/{fqdn}/privkey.pem")
+}
+
+fn path_exists(path: &str) -> bool {
+    Path::new(path).exists()
+}
+
 fn terminal_attached() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
@@ -300,6 +387,58 @@ fn render_setup_banner(current_url: &str) {
         gray = GRAY,
         orange_dark = ORANGE_DARK,
         url = normalized_url,
+        reset = RESET,
+    );
+    println!();
+}
+
+fn render_tls_banner(fqdn: &str, cert_path: &str, key_path: &str) {
+    println!();
+    println!(
+        "{gray_dark}╭──────────────────────────────────────────────────────────────╮{reset}",
+        gray_dark = GRAY_DARK,
+        reset = RESET,
+    );
+    println!(
+        "{gray_dark}│{reset} {orange}TLS setup required{reset}                                            {gray_dark}│{reset}",
+        gray_dark = GRAY_DARK,
+        orange = ORANGE,
+        reset = RESET,
+    );
+    println!(
+        "{gray_dark}│{reset} SSL is enabled for {orange_dark}{fqdn}{reset}{gray_dark}. skyportd expects Let’s Encrypt. {gray_dark}│{reset}",
+        gray_dark = GRAY_DARK,
+        orange_dark = ORANGE_DARK,
+        fqdn = fqdn,
+        reset = RESET,
+    );
+    println!(
+        "{gray_dark}│{reset} If those files do not exist, enter the certificate and key  {gray_dark}│{reset}",
+        gray_dark = GRAY_DARK,
+        reset = RESET,
+    );
+    println!(
+        "{gray_dark}│{reset} paths you want skyportd to use for its API listener.       {gray_dark}│{reset}",
+        gray_dark = GRAY_DARK,
+        reset = RESET,
+    );
+    println!(
+        "{gray_dark}╰──────────────────────────────────────────────────────────────╯{reset}",
+        gray_dark = GRAY_DARK,
+        reset = RESET,
+    );
+    println!(
+        "{gray}Expected certificate:{reset} {orange_dark}{cert_path}{reset}",
+        gray = GRAY,
+        orange_dark = ORANGE_DARK,
+        cert_path = cert_path,
+        reset = RESET,
+    );
+    println!(
+        "{gray}Expected private key:{reset} {orange_dark}{key_path}{reset}",
+        gray = GRAY,
+        orange_dark = ORANGE_DARK,
+        key_path = key_path,
         reset = RESET,
     );
     println!();
@@ -359,6 +498,24 @@ fn prompt_configuration_token(existing_token: Option<&str>) -> Result<String> {
 
         println!(
             "{orange}•{reset} {gray}A configuration token is required.{reset}",
+            orange = ORANGE,
+            gray = GRAY,
+            reset = RESET,
+        );
+    }
+}
+
+fn prompt_existing_path(label: &str, default: Option<&str>) -> Result<String> {
+    loop {
+        let input = prompt_line(label, default)?;
+        let trimmed = input.trim();
+
+        if path_exists(trimmed) {
+            return Ok(trimmed.to_string());
+        }
+
+        println!(
+            "{orange}•{reset} {gray}That path does not exist. Enter a valid file path.{reset}",
             orange = ORANGE,
             gray = GRAY,
             reset = RESET,
@@ -430,6 +587,7 @@ mod tests {
                 url: url.to_string(),
                 configuration_token: token.map(str::to_string),
                 daemon_secret: None,
+                daemon_callback_token: None,
                 node_id: None,
             },
             logging: LoggingSection {
@@ -437,6 +595,7 @@ mod tests {
                 format: LogFormat::Pretty,
             },
             runtime: RuntimeSection { worker_threads: 0 },
+            node: None,
         }
     }
 
@@ -492,5 +651,17 @@ mod tests {
         assert!(!is_compatibility_error_message(
             "The enrollment token is invalid."
         ));
+    }
+
+    #[test]
+    fn resolves_letsencrypt_paths_from_fqdn() {
+        assert_eq!(
+            default_tls_cert_path("node.example.com"),
+            "/etc/letsencrypt/live/node.example.com/fullchain.pem"
+        );
+        assert_eq!(
+            default_tls_key_path("node.example.com"),
+            "/etc/letsencrypt/live/node.example.com/privkey.pem"
+        );
     }
 }
