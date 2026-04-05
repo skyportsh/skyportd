@@ -1,0 +1,12 @@
+[daemon]
+name = "skyportd"
+uuid = "00000000-0000-0000-0000-000000000000"
+tick_interval = "5s"
+shutdown_timeout = "30s"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[runtime]
+worker_threads = 0
