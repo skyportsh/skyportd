@@ -237,6 +237,7 @@ async fn boot_server(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let volume_path = resolve_volume_path(config, server)?;
+    registry.append_console_message(server.id, "system", "Checking disk space limits...")?;
     ensure_disk_limit(&volume_path, server.limits.disk_mib)?;
 
     let image = select_runtime_image(&server.cargo)?;

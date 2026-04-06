@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -12,6 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -82,6 +83,14 @@ struct WsClientEvent {
     event: String,
     #[serde(default)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WsTokenPayload {
+    daemon_uuid: String,
+    exp: u64,
+    panel_version: String,
+    server_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -561,6 +570,8 @@ async fn server_ws(
             state.server_registry,
             server_id,
             config.panel.daemon_callback_token,
+            query.uuid,
+            query.panel_version,
         )
     }))
 }
@@ -570,6 +581,8 @@ async fn handle_server_ws(
     registry: ServerRegistry,
     server_id: u64,
     expected_token: Option<String>,
+    request_uuid: String,
+    request_panel_version: String,
 ) {
     let mut authenticated = false;
     let mut stats_subscribed = false;
@@ -648,7 +661,13 @@ async fn handle_server_ws(
                         };
 
                         if event.event == "auth" {
-                            match authenticate_ws_event(&expected_token, &event) {
+                            match authenticate_ws_event(
+                                expected_token.as_deref(),
+                                &event,
+                                server_id,
+                                &request_uuid,
+                                &request_panel_version,
+                            ) {
                                 Ok(()) => {
                                     authenticated = true;
 
@@ -822,9 +841,14 @@ fn parse_ws_client_event(payload: &str) -> Result<WsClientEvent> {
     serde_json::from_str::<WsClientEvent>(payload).context("Invalid websocket payload.")
 }
 
-fn authenticate_ws_event(expected_token: &Option<String>, event: &WsClientEvent) -> Result<()> {
-    let expected = expected_token
-        .as_deref()
+fn authenticate_ws_event(
+    expected_token: Option<&str>,
+    event: &WsClientEvent,
+    server_id: u64,
+    request_uuid: &str,
+    request_panel_version: &str,
+) -> Result<()> {
+    let secret = expected_token
         .filter(|token| !token.is_empty())
         .context("Missing daemon callback token.")?;
     let provided = event
@@ -833,9 +857,43 @@ fn authenticate_ws_event(expected_token: &Option<String>, event: &WsClientEvent)
         .map(String::as_str)
         .filter(|value| !value.trim().is_empty())
         .context("The auth event requires a token.")?;
+    let (payload_hex, signature_hex) = provided
+        .split_once('.')
+        .context("The websocket token is malformed.")?;
 
-    if provided != expected {
-        bail!("The callback token is invalid.");
+    let expected_signature = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes()),
+        payload_hex.as_bytes(),
+    );
+
+    if hex_encode(expected_signature.as_ref()) != signature_hex {
+        bail!("The websocket token signature is invalid.");
+    }
+
+    let payload_json = String::from_utf8(hex_decode(payload_hex)?)
+        .context("The websocket token payload is invalid UTF-8.")?;
+    let payload = serde_json::from_str::<WsTokenPayload>(&payload_json)
+        .context("The websocket token payload is invalid JSON.")?;
+
+    if payload.server_id != server_id {
+        bail!("The websocket token does not belong to this server.");
+    }
+
+    if payload.daemon_uuid != request_uuid {
+        bail!("The websocket token daemon identity is invalid.");
+    }
+
+    if payload.panel_version != request_panel_version {
+        bail!("The websocket token panel version is invalid.");
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("The system clock is invalid.")?
+        .as_secs();
+
+    if payload.exp <= now {
+        bail!("The websocket token has expired.");
     }
 
     Ok(())
@@ -862,6 +920,29 @@ fn power_signal_name(signal: PowerSignal) -> &'static str {
     }
 }
 
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        bail!("The websocket token payload is malformed.");
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut index = 0;
+
+    while index < value.len() {
+        let byte = u8::from_str_radix(&value[index..index + 2], 16).with_context(|| {
+            format!("The websocket token payload contains invalid hex at byte {index}.")
+        })?;
+        bytes.push(byte);
+        index += 2;
+    }
+
+    Ok(bytes)
+}
+
+fn hex_encode(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn ws_event_payload(event: &str, args: Vec<Value>) -> String {
     json!({
         "event": event,
@@ -871,10 +952,10 @@ fn ws_event_payload(event: &str, args: Vec<Value>) -> String {
 }
 
 fn console_event_name(source: &str) -> &'static str {
-    if source == "install" {
-        "install output"
-    } else {
-        "console output"
+    match source {
+        "install" => "install output",
+        "system" => "daemon message",
+        _ => "console output",
     }
 }
 
@@ -1323,6 +1404,22 @@ mod tests {
     }
 
     #[test]
+    fn system_console_messages_use_daemon_message_events() {
+        let payload = ws_event_payload(
+            console_event_name("system"),
+            vec![Value::String("Pulling runtime image...".to_string())],
+        );
+
+        expect_json(
+            &payload,
+            json!({
+                "event": "daemon message",
+                "args": ["Pulling runtime image..."],
+            }),
+        );
+    }
+
+    #[test]
     fn status_events_use_wings_style_envelope() {
         let payload = ws_event_payload("status", vec![Value::String("running".to_string())]);
 
@@ -1346,13 +1443,48 @@ mod tests {
 
     #[test]
     fn auth_event_requires_matching_token() {
+        let payload_hex = hex_encode(
+            serde_json::to_string(&WsTokenPayload {
+                daemon_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                exp: current_unix_timestamp() + 60,
+                panel_version: CURRENT_VERSION.to_string(),
+                server_id: 42,
+            })
+            .expect("token payload json")
+            .as_bytes(),
+        );
+        let signature = hex_encode(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, b"callback-token"),
+                payload_hex.as_bytes(),
+            )
+            .as_ref(),
+        );
         let event = WsClientEvent {
             event: "auth".to_string(),
-            args: vec!["callback-token".to_string()],
+            args: vec![format!("{payload_hex}.{signature}")],
         };
 
-        assert!(authenticate_ws_event(&Some("callback-token".to_string()), &event).is_ok());
-        assert!(authenticate_ws_event(&Some("other-token".to_string()), &event).is_err());
+        assert!(
+            authenticate_ws_event(
+                Some("callback-token"),
+                &event,
+                42,
+                "550e8400-e29b-41d4-a716-446655440000",
+                CURRENT_VERSION,
+            )
+            .is_ok()
+        );
+        assert!(
+            authenticate_ws_event(
+                Some("other-token"),
+                &event,
+                42,
+                "550e8400-e29b-41d4-a716-446655440000",
+                CURRENT_VERSION,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1366,6 +1498,13 @@ mod tests {
             PowerSignal::Kill
         ));
         assert!(parse_power_signal(Some(&"reinstall".to_string())).is_err());
+    }
+
+    fn current_unix_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("valid system time")
+            .as_secs()
     }
 
     fn expect_json(actual: &str, expected: Value) {
