@@ -230,10 +230,13 @@ async fn provision_and_install(
         .arg("-w")
         .arg("/mnt/server")
         .arg("--entrypoint")
-        .arg(entrypoint)
-        .arg(install_image)
-        .arg("-c")
-        .arg(&install_script);
+        .arg(entrypoint);
+
+    for (key, value) in default_environment(&server.cargo) {
+        command.arg("-e").arg(format!("{key}={value}"));
+    }
+
+    command.arg(install_image).arg("-c").arg(&install_script);
 
     let status = run_streaming_command(
         command,
@@ -542,7 +545,7 @@ fn interpolate_config_value(value: &str, server: &ManagedServerRecord) -> String
 }
 
 fn interpolate_runtime_string(value: &str, server: &ManagedServerRecord) -> String {
-    value
+    let interpolated = value
         .replace(
             "{{server.memory_limit}}",
             &server.limits.memory_mib.to_string(),
@@ -562,7 +565,13 @@ fn interpolate_runtime_string(value: &str, server: &ManagedServerRecord) -> Stri
                 .ip_alias
                 .as_deref()
                 .unwrap_or(server.allocation.bind_ip.as_str()),
-        )
+        );
+
+    default_environment(&server.cargo)
+        .into_iter()
+        .fold(interpolated, |result, (key, value)| {
+            result.replace(&format!("{{{{{key}}}}}"), &value)
+        })
 }
 
 fn startup_matchers(config_startup: &str) -> Vec<String> {
@@ -844,6 +853,71 @@ mod tests {
         let contents = std::fs::read_to_string(file).unwrap();
         assert!(contents.contains("server-ip=0.0.0.0"));
         assert!(contents.contains("server-port=25565"));
+    }
+
+    #[test]
+    fn runtime_interpolation_replaces_cargo_variable_placeholders() {
+        let server = ManagedServerRecord {
+            id: 1,
+            node_id: 1,
+            name: "Paper".to_string(),
+            status: "offline".to_string(),
+            volume_path: "volumes/1".to_string(),
+            created_at: "2026-04-06T00:00:00Z".to_string(),
+            updated_at: "2026-04-06T00:00:00Z".to_string(),
+            allocation: crate::server_registry::ManagedServerAllocation {
+                id: 1,
+                bind_ip: "0.0.0.0".to_string(),
+                port: 25565,
+                ip_alias: None,
+            },
+            container_id: None,
+            last_error: None,
+            user: crate::server_registry::ManagedServerUser {
+                id: 1,
+                name: "Test".to_string(),
+                email: "test@example.com".to_string(),
+            },
+            limits: crate::server_registry::ManagedServerLimits {
+                memory_mib: 1024,
+                cpu_limit: 100,
+                disk_mib: 10240,
+            },
+            cargo: ManagedServerCargo {
+                id: 1,
+                name: "Paper".to_string(),
+                slug: "paper".to_string(),
+                source_type: "pterodactyl".to_string(),
+                startup_command: "java -jar {{SERVER_JARFILE}}".to_string(),
+                config_files: "{}".to_string(),
+                config_startup: "{}".to_string(),
+                config_logs: "{}".to_string(),
+                config_stop: "stop".to_string(),
+                install_script: None,
+                install_container: None,
+                install_entrypoint: None,
+                features: vec![],
+                docker_images: BTreeMap::new(),
+                file_denylist: vec![],
+                file_hidden_list: vec![],
+                variables: vec![crate::server_registry::ManagedServerVariable {
+                    name: "Server Jar File".to_string(),
+                    description: "".to_string(),
+                    env_variable: "SERVER_JARFILE".to_string(),
+                    default_value: "server.jar".to_string(),
+                    user_viewable: true,
+                    user_editable: true,
+                    rules: "required".to_string(),
+                    field_type: "text".to_string(),
+                }],
+                definition: Value::Null,
+            },
+        };
+
+        assert_eq!(
+            interpolate_runtime_string(&server.cargo.startup_command, &server),
+            "java -jar server.jar",
+        );
     }
 
     #[test]
