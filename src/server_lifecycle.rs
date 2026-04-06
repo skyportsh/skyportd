@@ -76,6 +76,9 @@ impl ServerLifecycleService {
                         let active = Arc::clone(&active);
                         let cancellation = self.cancellation.child_token();
                         let config = config.clone();
+                        let failure_status =
+                            reconciliation_failure_status(&server.status)
+                                .to_string();
 
                         tokio::spawn(async move {
                             let server_id = server.id;
@@ -85,7 +88,7 @@ impl ServerLifecycleService {
                                     &registry,
                                     &config,
                                     server_id,
-                                    "install_failed",
+                                    &failure_status,
                                     None,
                                     Some(&error.to_string()),
                                 ).await;
@@ -118,6 +121,13 @@ async fn should_reconcile(server: &ManagedServerRecord, config: &DaemonConfig) -
         "installing" => true,
         "install_failed" => false,
         _ => true,
+    }
+}
+
+fn reconciliation_failure_status(status: &str) -> &'static str {
+    match status {
+        "pending" | "installing" => "install_failed",
+        _ => "offline",
     }
 }
 
@@ -296,6 +306,7 @@ async fn boot_server(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let volume_path = resolve_volume_path(config, server)?;
+    ensure_server_boot_prerequisites(server, &volume_path)?;
     registry.append_console_message(server.id, "system", "Checking disk space limits...")?;
     ensure_disk_limit(&volume_path, server.limits.disk_mib)?;
 
@@ -632,6 +643,25 @@ fn matches_startup(line: &str, matchers: &[String]) -> bool {
         .any(|matcher| !matcher.is_empty() && line.contains(matcher))
 }
 
+fn ensure_server_boot_prerequisites(
+    server: &ManagedServerRecord,
+    volume_path: &Path,
+) -> Result<()> {
+    if cargo_has_feature(&server.cargo, "eula") {
+        write_eula_file(volume_path)?;
+    }
+
+    Ok(())
+}
+
+fn cargo_has_feature(cargo: &ManagedServerCargo, feature: &str) -> bool {
+    cargo.features.iter().any(|value| value == feature)
+}
+
+fn write_eula_file(volume_path: &Path) -> Result<()> {
+    std::fs::write(volume_path.join("eula.txt"), "eula=true\n").context("failed to write eula.txt")
+}
+
 fn default_environment(cargo: &ManagedServerCargo) -> BTreeMap<String, String> {
     cargo
         .variables
@@ -784,12 +814,33 @@ fn directory_size(path: &Path) -> Result<u64> {
 }
 
 fn select_runtime_image(cargo: &ManagedServerCargo) -> Result<String> {
+    if let Some(image) = highest_java_runtime_image(&cargo.docker_images) {
+        return Ok(image);
+    }
+
     cargo
         .docker_images
         .values()
         .next()
         .cloned()
         .ok_or_else(|| anyhow!("cargo does not define a runtime docker image"))
+}
+
+fn highest_java_runtime_image(images: &BTreeMap<String, String>) -> Option<String> {
+    images
+        .iter()
+        .filter_map(|(label, image)| {
+            parse_java_major_version(label).map(|version| (version, image))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, image)| image.clone())
+}
+
+fn parse_java_major_version(label: &str) -> Option<u64> {
+    label
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|segment| !segment.is_empty())
+        .and_then(|segment| segment.parse::<u64>().ok())
 }
 
 async fn runtime_container_is_running(server: &ManagedServerRecord) -> Result<bool> {
@@ -911,6 +962,32 @@ mod tests {
         let matchers = startup_matchers(r#"{"done":")! For help, type "}"#);
 
         assert_eq!(matchers, vec![")! For help, type "]);
+    }
+
+    #[test]
+    fn highest_java_runtime_image_uses_newest_java_label() {
+        let images = BTreeMap::from([
+            ("Java 25".to_string(), "java-25".to_string()),
+            ("Java 11".to_string(), "java-11".to_string()),
+            ("Java 21".to_string(), "java-21".to_string()),
+        ]);
+
+        assert_eq!(
+            highest_java_runtime_image(&images),
+            Some("java-25".to_string())
+        );
+    }
+
+    #[test]
+    fn ensure_server_boot_prerequisites_accepts_eula_when_required() {
+        let tempdir = tempdir().unwrap();
+        let mut server = sample_server();
+        server.cargo.features = vec!["eula".to_string()];
+
+        ensure_server_boot_prerequisites(&server, tempdir.path()).unwrap();
+
+        let eula = std::fs::read_to_string(tempdir.path().join("eula.txt")).unwrap();
+        assert_eq!(eula, "eula=true\n");
     }
 
     #[test]
@@ -1047,6 +1124,18 @@ mod tests {
         server.last_error = Some("Server exited before startup completed.".to_string());
 
         assert!(!should_reconcile(&server, &config).await);
+    }
+
+    #[test]
+    fn reconciliation_failures_only_mark_install_failed_during_installation() {
+        assert_eq!(reconciliation_failure_status("pending"), "install_failed");
+        assert_eq!(
+            reconciliation_failure_status("installing"),
+            "install_failed"
+        );
+        assert_eq!(reconciliation_failure_status("offline"), "offline");
+        assert_eq!(reconciliation_failure_status("starting"), "offline");
+        assert_eq!(reconciliation_failure_status("running"), "offline");
     }
 
     #[test]

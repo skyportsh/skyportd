@@ -961,6 +961,7 @@ fn parse_power_signal(signal: Option<&String>) -> Result<PowerSignal> {
         Some("stop") => Ok(PowerSignal::Stop),
         Some("restart") => Ok(PowerSignal::Restart),
         Some("kill") => Ok(PowerSignal::Kill),
+        Some("reinstall") => Ok(PowerSignal::Reinstall),
         Some(value) => bail!("Unsupported power state: {value}"),
         None => bail!("The set state event requires a power state."),
     }
@@ -1591,7 +1592,10 @@ mod tests {
             parse_power_signal(Some(&"kill".to_string())).expect("kill accepted"),
             PowerSignal::Kill
         ));
-        assert!(parse_power_signal(Some(&"reinstall".to_string())).is_err());
+        assert!(matches!(
+            parse_power_signal(Some(&"reinstall".to_string())).expect("reinstall accepted"),
+            PowerSignal::Reinstall
+        ));
     }
 
     #[test]
