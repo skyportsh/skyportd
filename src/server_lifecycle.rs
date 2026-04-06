@@ -114,7 +114,8 @@ async fn should_reconcile(server: &ManagedServerRecord, config: &DaemonConfig) -
     }
 
     match server.status.as_str() {
-        "pending" | "offline" | "starting" | "running" => true,
+        "pending" | "starting" | "running" => true,
+        "offline" => server.last_error.is_none(),
         "installing" => true,
         "install_failed" => false,
         _ => true,
@@ -266,7 +267,19 @@ async fn provision_and_install(
     registry.set_server_runtime(server.id, "offline", None, None)?;
     server.status = "offline".to_string();
 
-    boot_server(registry, server, config, cancellation).await
+    match boot_server(registry, server, config, cancellation).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            registry.append_console_message(
+                server.id,
+                "system",
+                &format!(
+                    "Initial startup failed after installation. The server remains offline: {error}"
+                ),
+            )?;
+            Ok(())
+        }
+    }
 }
 
 async fn boot_server(
@@ -963,6 +976,35 @@ mod tests {
                 definition: Value::Null,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn offline_servers_with_last_error_do_not_reconcile_automatically() {
+        let config = DaemonConfig {
+            daemon: crate::config::DaemonSection {
+                name: "skyportd".to_string(),
+                uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                tick_interval: Duration::from_secs(30),
+                shutdown_timeout: Duration::from_secs(30),
+            },
+            panel: crate::config::PanelSection {
+                url: "http://localhost".to_string(),
+                configuration_token: None,
+                daemon_secret: None,
+                daemon_callback_token: None,
+                node_id: Some(1),
+            },
+            logging: crate::config::LoggingSection {
+                level: "info".to_string(),
+                format: crate::config::LogFormat::Pretty,
+            },
+            runtime: crate::config::RuntimeSection { worker_threads: 1 },
+            node: None,
+        };
+        let mut server = sample_server();
+        server.last_error = Some("Server exited before startup completed.".to_string());
+
+        assert!(!should_reconcile(&server, &config).await);
     }
 
     #[test]
