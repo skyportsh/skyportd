@@ -16,9 +16,8 @@ const ORANGE_DARK: &str = "\x1b[38;2;217;36;0m";
 const GRAY: &str = "\x1b[38;2;120;120;120m";
 const RESET: &str = "\x1b[0m";
 
-pub fn init(config: &LoggingSection) -> Result<()> {
-    let env_filter =
-        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(config.level.as_str()))?;
+pub fn init(config: &LoggingSection, level_override: Option<&str>) -> Result<()> {
+    let env_filter = build_env_filter(config, level_override)?;
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -137,6 +136,16 @@ fn level_label(level: Level) -> &'static str {
     }
 }
 
+fn build_env_filter(config: &LoggingSection, level_override: Option<&str>) -> Result<EnvFilter> {
+    if let Some(level_override) = level_override {
+        return EnvFilter::try_new(level_override).map_err(anyhow::Error::msg);
+    }
+
+    EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(config.level.as_str()))
+        .map_err(anyhow::Error::msg)
+}
+
 fn trim_debug_quotes(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -157,5 +166,17 @@ mod tests {
     fn trims_message_debug_quotes() {
         assert_eq!(trim_debug_quotes("\"daemon starting\""), "daemon starting");
         assert_eq!(trim_debug_quotes("plain"), "plain");
+    }
+
+    #[test]
+    fn debug_override_wins_over_config_level() {
+        let config = LoggingSection {
+            level: "info".to_string(),
+            format: LogFormat::Pretty,
+        };
+
+        let filter = build_env_filter(&config, Some("debug")).unwrap();
+
+        assert_eq!(filter.to_string(), "debug");
     }
 }
