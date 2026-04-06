@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use reqwest::Client;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::select;
@@ -75,7 +77,7 @@ impl ServerLifecycleService {
 
                         tokio::spawn(async move {
                             let server_id = server.id;
-                            if let Err(error) = reconcile_server(registry.clone(), server, config, cancellation).await {
+                            if let Err(error) = reconcile_server(registry.clone(), server, config.clone(), cancellation).await {
                                 warn!(server_id, error = %error, "server reconciliation failed");
                                 let _ = registry.set_server_runtime(
                                     server_id,
@@ -88,6 +90,9 @@ impl ServerLifecycleService {
                                     "system",
                                     &format!("Reconciliation failed: {error}"),
                                 );
+                                if let Err(callback_error) = notify_panel_install_failure(&config, server_id, &error.to_string()).await {
+                                    warn!(server_id, error = %callback_error, "failed to notify panel about install failure");
+                                }
                             }
 
                             active.lock().await.remove(&server_id);
@@ -156,12 +161,14 @@ async fn provision_and_install(
     registry.set_server_runtime(server.id, "installing", None, None)?;
     registry.append_console_message(server.id, "system", "Preparing volume directory...")?;
 
-    let install_script = server
-        .cargo
-        .install_script
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("");
+    let install_script = normalize_shell_script(
+        server
+            .cargo
+            .install_script
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(""),
+    );
     let install_image = server
         .cargo
         .install_container
@@ -210,7 +217,7 @@ async fn provision_and_install(
         .arg(entrypoint)
         .arg(install_image)
         .arg("-c")
-        .arg(install_script);
+        .arg(&install_script);
 
     let status =
         run_streaming_command(command, registry, server.id, "install", cancellation).await?;
@@ -570,6 +577,42 @@ fn default_environment(cargo: &ManagedServerCargo) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn normalize_shell_script(script: &str) -> String {
+    script.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+async fn notify_panel_install_failure(
+    config: &DaemonConfig,
+    server_id: u64,
+    error: &str,
+) -> Result<()> {
+    let Some(daemon_secret) = config.panel.daemon_secret.as_deref() else {
+        return Ok(());
+    };
+
+    let response = Client::new()
+        .post(format!(
+            "{}/api/daemon/servers/{server_id}/runtime",
+            config.panel.url.trim_end_matches('/'),
+        ))
+        .bearer_auth(daemon_secret)
+        .json(&json!({
+            "uuid": config.daemon.uuid,
+            "version": env!("CARGO_PKG_VERSION"),
+            "status": "install_failed",
+            "last_error": error,
+        }))
+        .send()
+        .await
+        .context("failed to notify panel about install failure")?
+        .error_for_status()
+        .context("panel rejected install failure update")?;
+
+    let _ = response;
+
+    Ok(())
+}
+
 fn resolve_volume_path(_config: &DaemonConfig, server: &ManagedServerRecord) -> Result<PathBuf> {
     Ok(project_root()?.join(&server.volume_path))
 }
@@ -756,5 +799,13 @@ mod tests {
         let missing = tempdir.path().join("missing");
 
         assert_eq!(directory_size(&missing).unwrap(), 0);
+    }
+
+    #[test]
+    fn normalize_shell_script_removes_windows_line_endings() {
+        assert_eq!(
+            normalize_shell_script("echo test\r\nif true; then\r\n  echo ok\r\nfi\r\n"),
+            "echo test\nif true; then\n  echo ok\nfi\n",
+        );
     }
 }
