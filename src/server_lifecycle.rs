@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -158,8 +160,12 @@ async fn provision_and_install(
         .await
         .with_context(|| format!("failed to create {}", volume_path.display()))?;
 
+    let install_log_path = volume_path.join("install.log");
+    reset_install_log(&install_log_path)?;
+
     registry.set_server_runtime(server.id, "installing", None, None)?;
     registry.append_console_message(server.id, "system", "Preparing volume directory...")?;
+    append_install_log(&install_log_path, "system", "Preparing volume directory...")?;
 
     let install_script = normalize_shell_script(
         server
@@ -182,6 +188,11 @@ async fn provision_and_install(
             "system",
             "No install container configured. Skipping installation.",
         )?;
+        append_install_log(
+            &install_log_path,
+            "system",
+            "No install container configured. Skipping installation.",
+        )?;
         registry.set_server_runtime(server.id, "offline", None, None)?;
         server.status = "offline".to_string();
 
@@ -190,6 +201,11 @@ async fn provision_and_install(
 
     registry.append_console_message(
         server.id,
+        "system",
+        &format!("Running install container {install_image}..."),
+    )?;
+    append_install_log(
+        &install_log_path,
         "system",
         &format!("Running install container {install_image}..."),
     )?;
@@ -219,18 +235,31 @@ async fn provision_and_install(
         .arg("-c")
         .arg(&install_script);
 
-    let status =
-        run_streaming_command(command, registry, server.id, "install", cancellation).await?;
+    let status = run_streaming_command(
+        command,
+        registry,
+        server.id,
+        "install",
+        cancellation,
+        Some(&install_log_path),
+    )
+    .await?;
 
     if !status.success() {
         let code = status.code().unwrap_or_default();
         let message = format!("Installation failed with exit code {code}.");
         registry.append_console_message(server.id, "system", &message)?;
+        append_install_log(&install_log_path, "system", &message)?;
         registry.set_server_runtime(server.id, "install_failed", None, Some(&message))?;
         bail!(message);
     }
 
     registry.append_console_message(server.id, "system", "Installation completed successfully.")?;
+    append_install_log(
+        &install_log_path,
+        "system",
+        "Installation completed successfully.",
+    )?;
     registry.set_server_runtime(server.id, "offline", None, None)?;
     server.status = "offline".to_string();
 
@@ -581,6 +610,21 @@ fn normalize_shell_script(script: &str) -> String {
     script.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn reset_install_log(path: &Path) -> Result<()> {
+    std::fs::write(path, "").with_context(|| format!("failed to reset {}", path.display()))
+}
+
+fn append_install_log(path: &Path, source: &str, message: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    writeln!(file, "[{source}] {message}")
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 async fn notify_panel_install_failure(
     config: &DaemonConfig,
     server_id: u64,
@@ -729,6 +773,7 @@ async fn run_streaming_command(
     server_id: u64,
     source: &str,
     cancellation: &CancellationToken,
+    install_log_path: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().context("failed to spawn docker command")?;
@@ -745,13 +790,21 @@ async fn run_streaming_command(
             }
             line = stdout_lines.next_line() => {
                 match line.context("failed to read command stdout")? {
-                    Some(line) => registry.append_console_message(server_id, source, &line)?,
+                    Some(line) => {
+                        registry.append_console_message(server_id, source, &line)?;
+                        if let Some(install_log_path) = install_log_path {
+                            append_install_log(install_log_path, source, &line)?;
+                        }
+                    }
                     None => break,
                 }
             }
             line = stderr_lines.next_line() => {
                 if let Some(line) = line.context("failed to read command stderr")? {
                     registry.append_console_message(server_id, source, &line)?;
+                    if let Some(install_log_path) = install_log_path {
+                        append_install_log(install_log_path, source, &line)?;
+                    }
                 }
             }
         }
@@ -807,5 +860,19 @@ mod tests {
             normalize_shell_script("echo test\r\nif true; then\r\n  echo ok\r\nfi\r\n"),
             "echo test\nif true; then\n  echo ok\nfi\n",
         );
+    }
+
+    #[test]
+    fn append_install_log_writes_prefixed_lines() {
+        let tempdir = tempdir().unwrap();
+        let log_path = tempdir.path().join("install.log");
+
+        reset_install_log(&log_path).unwrap();
+        append_install_log(&log_path, "system", "Preparing volume directory...").unwrap();
+        append_install_log(&log_path, "install", "Downloading files...").unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(contents.contains("[system] Preparing volume directory..."));
+        assert!(contents.contains("[install] Downloading files..."));
     }
 }

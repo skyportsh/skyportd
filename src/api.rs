@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum_server::Handle;
@@ -288,6 +288,10 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
         .route("/api/daemon/servers/sync", post(sync_server))
         .route("/api/daemon/servers/{server_id}", delete(delete_server))
         .route("/api/daemon/servers/{server_id}/power", post(power_server))
+        .route(
+            "/api/daemon/servers/{server_id}/install-log",
+            get(download_install_log),
+        )
         .route("/api/daemon/servers/{server_id}/ws", get(server_ws))
         .with_state(state);
     let server_handle = handle.clone();
@@ -551,6 +555,44 @@ async fn power_server(
     info!(server_id = server.id, status = %server.status, "power action processed");
 
     Ok(Json(ApiSuccessResponse { ok: true }))
+}
+
+async fn download_install_log(
+    Path(server_id): Path<u64>,
+    Query(query): Query<WsAuthorizationQuery>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+    let path = resolve_volume_path(&server)
+        .map_err(internal_error)?
+        .join("install.log");
+
+    let contents = std::fs::read(&path).map_err(|error| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            format!("failed to read install log: {error}"),
+        )
+    })?;
+
+    let mut response = contents.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=server-{server_id}-install.log"
+        ))
+        .map_err(|error| internal_error(error.into()))?,
+    );
+
+    Ok(response)
 }
 
 async fn server_ws(
