@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod configuration;
 mod logging;
+mod server_lifecycle;
 mod server_registry;
 mod service;
 mod shutdown;

@@ -23,6 +23,8 @@ pub struct ManagedServerRecord {
     pub volume_path: String,
     pub created_at: String,
     pub updated_at: String,
+    pub container_id: Option<String>,
+    pub last_error: Option<String>,
     pub user: ManagedServerUser,
     pub limits: ManagedServerLimits,
     pub cargo: ManagedServerCargo,
@@ -130,18 +132,40 @@ impl ServerRegistry {
                 file_denylist_json TEXT NOT NULL,
                 file_hidden_list_json TEXT NOT NULL,
                 variables_json TEXT NOT NULL,
-                definition_json TEXT NOT NULL
+                definition_json TEXT NOT NULL,
+                container_id TEXT,
+                last_error TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_servers_node_id ON servers (node_id);
             CREATE INDEX IF NOT EXISTS idx_servers_status ON servers (status);
+            CREATE TABLE IF NOT EXISTS server_console_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_server_console_messages_server_id ON server_console_messages (server_id, id);
             "#,
         )?;
+
+        self.ensure_server_columns(&connection)?;
 
         Ok(())
     }
 
     pub fn upsert_server(&self, server: &ManagedServerRecord) -> Result<()> {
         let connection = self.open()?;
+        let existing_runtime = self.server_runtime(&connection, server.id)?;
+
+        let status = existing_runtime
+            .as_ref()
+            .map(|runtime| runtime.status.clone())
+            .unwrap_or_else(|| server.status.clone());
+        let container_id = existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.container_id.clone());
+        let last_error = existing_runtime.and_then(|runtime| runtime.last_error);
 
         connection.execute(
             r#"
@@ -153,7 +177,7 @@ impl ServerRegistry {
                 startup_command, config_files, config_startup, config_logs, config_stop,
                 install_script, install_container, install_entrypoint,
                 features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-                variables_json, definition_json
+                variables_json, definition_json, container_id, last_error
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10,
@@ -162,7 +186,7 @@ impl ServerRegistry {
                 ?18, ?19, ?20, ?21, ?22,
                 ?23, ?24, ?25,
                 ?26, ?27, ?28, ?29,
-                ?30, ?31
+                ?30, ?31, ?32, ?33
             )
             ON CONFLICT(id) DO UPDATE SET
                 node_id = excluded.node_id,
@@ -194,13 +218,15 @@ impl ServerRegistry {
                 file_denylist_json = excluded.file_denylist_json,
                 file_hidden_list_json = excluded.file_hidden_list_json,
                 variables_json = excluded.variables_json,
-                definition_json = excluded.definition_json
+                definition_json = excluded.definition_json,
+                container_id = excluded.container_id,
+                last_error = excluded.last_error
             "#,
             params![
                 server.id,
                 server.node_id,
                 server.name,
-                server.status,
+                status,
                 server.volume_path,
                 server.created_at,
                 server.updated_at,
@@ -228,37 +254,17 @@ impl ServerRegistry {
                 serde_json::to_string(&server.cargo.file_hidden_list)?,
                 serde_json::to_string(&server.cargo.variables)?,
                 serde_json::to_string(&server.cargo.definition)?,
+                container_id,
+                last_error,
             ],
         )?;
 
         Ok(())
     }
 
-    pub fn delete_server(&self, server_id: u64) -> Result<bool> {
-        let connection = self.open()?;
-        let deleted =
-            connection.execute("DELETE FROM servers WHERE id = ?1", params![server_id])?;
-
-        Ok(deleted > 0)
-    }
-
     pub fn get_server(&self, server_id: u64) -> Result<Option<ManagedServerRecord>> {
         let connection = self.open()?;
-        let mut statement = connection.prepare(
-            r#"
-            SELECT
-                id, node_id, name, status, volume_path, created_at, updated_at,
-                user_id, user_name, user_email,
-                memory_mib, cpu_limit, disk_mib,
-                cargo_id, cargo_name, cargo_slug, cargo_source_type,
-                startup_command, config_files, config_startup, config_logs, config_stop,
-                install_script, install_container, install_entrypoint,
-                features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-                variables_json, definition_json
-            FROM servers
-            WHERE id = ?1
-            "#,
-        )?;
+        let mut statement = connection.prepare(&format!("{SERVER_SELECT_SQL} WHERE id = ?1"))?;
 
         statement
             .query_row(params![server_id], map_server_row)
@@ -266,11 +272,140 @@ impl ServerRegistry {
             .context("failed to fetch server from registry")
     }
 
+    pub fn list_servers_for_node(&self, node_id: u64) -> Result<Vec<ManagedServerRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(&format!(
+            "{SERVER_SELECT_SQL} WHERE node_id = ?1 ORDER BY id ASC"
+        ))?;
+        let rows = statement.query_map(params![node_id], map_server_row)?;
+
+        let mut servers = Vec::new();
+
+        for row in rows {
+            servers.push(row?);
+        }
+
+        Ok(servers)
+    }
+
+    pub fn delete_server(&self, server_id: u64) -> Result<bool> {
+        let connection = self.open()?;
+        connection.execute(
+            "DELETE FROM server_console_messages WHERE server_id = ?1",
+            params![server_id],
+        )?;
+        let deleted =
+            connection.execute("DELETE FROM servers WHERE id = ?1", params![server_id])?;
+
+        Ok(deleted > 0)
+    }
+
+    pub fn set_server_runtime(
+        &self,
+        server_id: u64,
+        status: &str,
+        container_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "UPDATE servers SET status = ?1, container_id = ?2, last_error = ?3 WHERE id = ?4",
+            params![status, container_id, last_error, server_id],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn append_console_message(
+        &self,
+        server_id: u64,
+        source: &str,
+        message: &str,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT INTO server_console_messages (server_id, source, message) VALUES (?1, ?2, ?3)",
+            params![server_id, source, message],
+        )?;
+
+        Ok(())
+    }
+
     fn open(&self) -> Result<Connection> {
         Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))
     }
+
+    fn ensure_server_columns(&self, connection: &Connection) -> Result<()> {
+        let existing_columns = self.server_columns(connection)?;
+
+        if !existing_columns
+            .iter()
+            .any(|column| column == "container_id")
+        {
+            connection.execute("ALTER TABLE servers ADD COLUMN container_id TEXT", [])?;
+        }
+
+        if !existing_columns.iter().any(|column| column == "last_error") {
+            connection.execute("ALTER TABLE servers ADD COLUMN last_error TEXT", [])?;
+        }
+
+        Ok(())
+    }
+
+    fn server_columns(&self, connection: &Connection) -> Result<Vec<String>> {
+        let mut statement = connection.prepare("PRAGMA table_info(servers)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut columns = Vec::new();
+
+        for row in rows {
+            columns.push(row?);
+        }
+
+        Ok(columns)
+    }
+
+    fn server_runtime(
+        &self,
+        connection: &Connection,
+        server_id: u64,
+    ) -> Result<Option<ServerRuntime>> {
+        connection
+            .query_row(
+                "SELECT status, container_id, last_error FROM servers WHERE id = ?1",
+                params![server_id],
+                |row| {
+                    Ok(ServerRuntime {
+                        status: row.get(0)?,
+                        container_id: row.get(1)?,
+                        last_error: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load server runtime state")
+    }
 }
+
+#[derive(Debug)]
+struct ServerRuntime {
+    status: String,
+    container_id: Option<String>,
+    last_error: Option<String>,
+}
+
+const SERVER_SELECT_SQL: &str = r#"
+SELECT
+    id, node_id, name, status, volume_path, created_at, updated_at,
+    user_id, user_name, user_email,
+    memory_mib, cpu_limit, disk_mib,
+    cargo_id, cargo_name, cargo_slug, cargo_source_type,
+    startup_command, config_files, config_startup, config_logs, config_stop,
+    install_script, install_container, install_entrypoint,
+    features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
+    variables_json, definition_json, container_id, last_error
+FROM servers
+"#;
 
 fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerRecord> {
     Ok(ManagedServerRecord {
@@ -281,6 +416,8 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
         volume_path: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        container_id: row.get(31)?,
+        last_error: row.get(32)?,
         user: ManagedServerUser {
             id: row.get(7)?,
             name: row.get(8)?,
@@ -346,6 +483,8 @@ mod tests {
             volume_path: "volumes/42".to_string(),
             created_at: "2026-04-06T12:00:00Z".to_string(),
             updated_at: "2026-04-06T12:00:00Z".to_string(),
+            container_id: None,
+            last_error: None,
             user: ManagedServerUser {
                 id: 5,
                 name: "Jane Doe".to_string(),
@@ -391,9 +530,17 @@ mod tests {
         };
 
         registry.upsert_server(&server).unwrap();
+        registry
+            .set_server_runtime(server.id, "installing", Some("container-123"), Some("oops"))
+            .unwrap();
+        registry
+            .append_console_message(server.id, "system", "Preparing volume")
+            .unwrap();
 
         let stored = registry.get_server(server.id).unwrap().unwrap();
-        assert_eq!(stored, server);
+        assert_eq!(stored.status, "installing");
+        assert_eq!(stored.container_id.as_deref(), Some("container-123"));
+        assert_eq!(stored.last_error.as_deref(), Some("oops"));
 
         let updated = ManagedServerRecord {
             name: "Updated Survival".to_string(),
@@ -404,6 +551,11 @@ mod tests {
 
         let stored = registry.get_server(server.id).unwrap().unwrap();
         assert_eq!(stored.name, "Updated Survival");
+        assert_eq!(stored.status, "installing");
+        assert_eq!(stored.container_id.as_deref(), Some("container-123"));
+
+        let listed = registry.list_servers_for_node(server.node_id).unwrap();
+        assert_eq!(listed.len(), 1);
 
         assert!(registry.delete_server(server.id).unwrap());
         assert!(registry.get_server(server.id).unwrap().is_none());

@@ -365,6 +365,20 @@ async fn sync_server(
     authorize_request(&config, &headers)?;
     ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
 
+    let configured_node_id = config.panel.node_id.ok_or_else(|| {
+        error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "This daemon is not enrolled to a node yet.".to_string(),
+        )
+    })?;
+
+    if payload.server.node_id != configured_node_id {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The server does not belong to this node.".to_string(),
+        ));
+    }
+
     let server = ManagedServerRecord {
         id: payload.server.id,
         node_id: payload.server.node_id,
@@ -373,6 +387,8 @@ async fn sync_server(
         volume_path: payload.server.volume_path,
         created_at: payload.server.created_at,
         updated_at: payload.server.updated_at,
+        container_id: None,
+        last_error: None,
         user: ManagedServerUser {
             id: payload.server.user.id,
             name: payload.server.user.name,
