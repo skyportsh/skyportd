@@ -78,6 +78,15 @@ pub struct ManagedServerVariable {
     pub field_type: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsoleMessageRecord {
+    pub id: u64,
+    pub server_id: u64,
+    pub source: String,
+    pub message: String,
+    pub created_at: String,
+}
+
 impl ServerRegistry {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
@@ -329,6 +338,40 @@ impl ServerRegistry {
         )?;
 
         Ok(())
+    }
+
+    pub fn console_messages_since(
+        &self,
+        server_id: u64,
+        last_id: u64,
+        limit: u64,
+    ) -> Result<Vec<ConsoleMessageRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, server_id, source, message, created_at
+            FROM server_console_messages
+            WHERE server_id = ?1 AND id > ?2
+            ORDER BY id ASC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = statement.query_map(params![server_id, last_id, limit], |row| {
+            Ok(ConsoleMessageRecord {
+                id: row.get(0)?,
+                server_id: row.get(1)?,
+                source: row.get(2)?,
+                message: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut messages = Vec::new();
+
+        for row in rows {
+            messages.push(row?);
+        }
+
+        Ok(messages)
     }
 
     fn open(&self) -> Result<Connection> {

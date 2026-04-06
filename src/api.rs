@@ -1,26 +1,31 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use anyhow::{Context, Result, bail};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{delete, post};
+use axum::response::Response;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{DaemonConfig, NodeSection};
+use crate::config::{DaemonConfig, NodeSection, project_root};
 use crate::configuration;
 use crate::server_registry::{
-    ManagedServerCargo, ManagedServerLimits, ManagedServerRecord, ManagedServerUser,
-    ManagedServerVariable, ServerRegistry,
+    ConsoleMessageRecord, ManagedServerCargo, ManagedServerLimits, ManagedServerRecord,
+    ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,6 +62,30 @@ struct ServerSyncRequest {
 struct ServerDeleteRequest {
     uuid: String,
     panel_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerPowerRequest {
+    uuid: String,
+    panel_version: String,
+    signal: PowerSignal,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsAuthorizationQuery {
+    token: String,
+    uuid: String,
+    panel_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PowerSignal {
+    Start,
+    Stop,
+    Restart,
+    Kill,
+    Reinstall,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +263,15 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
         .route("/api/daemon/configuration/sync", post(sync_configuration))
         .route("/api/daemon/servers/sync", post(sync_server))
         .route("/api/daemon/servers/{server_id}", delete(delete_server))
+        .route("/api/daemon/servers/{server_id}/power", post(power_server))
+        .route(
+            "/api/daemon/servers/{server_id}/ws/console",
+            get(console_ws),
+        )
+        .route(
+            "/api/daemon/servers/{server_id}/ws/resources",
+            get(resources_ws),
+        )
         .with_state(state);
     let server_handle = handle.clone();
     let server_spec = spec.clone();
@@ -469,6 +507,421 @@ async fn delete_server(
     Ok(Json(ApiSuccessResponse { ok: true }))
 }
 
+async fn power_server(
+    Path(server_id): Path<u64>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServerPowerRequest>,
+) -> std::result::Result<Json<ApiSuccessResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+
+    let mut server = load_managed_server(&state.server_registry, &config, server_id)?;
+
+    match payload.signal {
+        PowerSignal::Start => {
+            if container_is_running(server.id)
+                .await
+                .map_err(internal_error)?
+            {
+                state
+                    .server_registry
+                    .append_console_message(
+                        server.id,
+                        "system",
+                        "Start requested, but the server is already running.",
+                    )
+                    .map_err(internal_error)?;
+            } else {
+                state
+                    .server_registry
+                    .set_server_runtime(server.id, "offline", None, None)
+                    .map_err(internal_error)?;
+                state
+                    .server_registry
+                    .append_console_message(
+                        server.id,
+                        "system",
+                        "Start requested. The server will be booted by the lifecycle worker.",
+                    )
+                    .map_err(internal_error)?;
+            }
+        }
+        PowerSignal::Stop => {
+            graceful_stop(&state.server_registry, &server)
+                .await
+                .map_err(internal_error)?;
+        }
+        PowerSignal::Restart => {
+            graceful_stop(&state.server_registry, &server)
+                .await
+                .map_err(internal_error)?;
+            state
+                .server_registry
+                .set_server_runtime(server.id, "offline", None, None)
+                .map_err(internal_error)?;
+            state
+                .server_registry
+                .append_console_message(
+                    server.id,
+                    "system",
+                    "Restart requested. The server will be started again by the lifecycle worker.",
+                )
+                .map_err(internal_error)?;
+        }
+        PowerSignal::Kill => {
+            kill_server(&state.server_registry, &server)
+                .await
+                .map_err(internal_error)?;
+        }
+        PowerSignal::Reinstall => {
+            remove_runtime_and_install_containers(server.id)
+                .await
+                .map_err(internal_error)?;
+            clear_server_volume(&server).await.map_err(internal_error)?;
+            state
+                .server_registry
+                .set_server_runtime(server.id, "pending", None, None)
+                .map_err(internal_error)?;
+            state
+                .server_registry
+                .append_console_message(server.id, "system", "Reinstall requested. Existing files were cleared and the lifecycle worker will reinstall the server.")
+                .map_err(internal_error)?;
+        }
+    }
+
+    server = load_managed_server(&state.server_registry, &config, server_id)?;
+    info!(server_id = server.id, status = %server.status, "power action processed");
+
+    Ok(Json(ApiSuccessResponse { ok: true }))
+}
+
+async fn console_ws(
+    ws: WebSocketUpgrade,
+    Path(server_id): Path<u64>,
+    Query(query): Query<WsAuthorizationQuery>,
+    State(state): State<ApiState>,
+) -> std::result::Result<Response, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_query(&config, &query)?;
+    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    load_managed_server(&state.server_registry, &config, server_id)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_console_ws(socket, state.server_registry, server_id)))
+}
+
+async fn resources_ws(
+    ws: WebSocketUpgrade,
+    Path(server_id): Path<u64>,
+    Query(query): Query<WsAuthorizationQuery>,
+    State(state): State<ApiState>,
+) -> std::result::Result<Response, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_query(&config, &query)?;
+    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    load_managed_server(&state.server_registry, &config, server_id)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_resources_ws(socket, state.server_registry, server_id)))
+}
+
+async fn handle_console_ws(mut socket: WebSocket, registry: ServerRegistry, server_id: u64) {
+    let mut last_id = 0_u64;
+
+    if let Ok(backlog) = registry.console_messages_since(server_id, 0, 200) {
+        for message in backlog {
+            last_id = message.id;
+            if send_console_message(&mut socket, &message).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let mut interval = time::interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let messages = match registry.console_messages_since(server_id, last_id, 200) {
+                    Ok(messages) => messages,
+                    Err(_) => break,
+                };
+
+                for message in messages {
+                    last_id = message.id;
+                    if send_console_message(&mut socket, &message).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Err(_)) => return,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn handle_resources_ws(mut socket: WebSocket, registry: ServerRegistry, server_id: u64) {
+    let mut interval = time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let server = match registry.get_server(server_id) {
+                    Ok(Some(server)) => server,
+                    _ => return,
+                };
+
+                let payload = match current_resource_snapshot(&server).await {
+                    Ok(payload) => payload,
+                    Err(error) => json!({
+                        "type": "resources",
+                        "server_id": server_id,
+                        "running": false,
+                        "error": error.to_string(),
+                    }),
+                };
+
+                if socket.send(Message::Text(payload.to_string().into())).await.is_err() {
+                    return;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Err(_)) => return,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn send_console_message(
+    socket: &mut WebSocket,
+    message: &ConsoleMessageRecord,
+) -> Result<()> {
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "console",
+                "id": message.id,
+                "server_id": message.server_id,
+                "source": message.source,
+                "message": message.message,
+                "created_at": message.created_at,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .context("failed to send console websocket message")
+}
+
+async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
+    let name = runtime_container_name(server.id);
+    let output = docker_command()
+        .arg("stats")
+        .arg("--no-stream")
+        .arg("--format")
+        .arg("{{json .}}")
+        .arg(&name)
+        .output()
+        .await
+        .context("failed to inspect docker stats")?;
+
+    if !output.status.success() {
+        return Ok(json!({
+            "type": "resources",
+            "server_id": server.id,
+            "running": false,
+            "status": server.status,
+        }));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(json!({
+            "type": "resources",
+            "server_id": server.id,
+            "running": false,
+            "status": server.status,
+        }));
+    }
+
+    let stats: Value =
+        serde_json::from_str(&stdout).context("failed to parse docker stats payload")?;
+
+    Ok(json!({
+        "type": "resources",
+        "server_id": server.id,
+        "running": true,
+        "status": server.status,
+        "stats": stats,
+    }))
+}
+
+async fn graceful_stop(registry: &ServerRegistry, server: &ManagedServerRecord) -> Result<()> {
+    if !container_is_running(server.id).await? {
+        registry.set_server_runtime(server.id, "offline", None, None)?;
+        registry.append_console_message(
+            server.id,
+            "system",
+            "Stop requested, but the server was already offline.",
+        )?;
+        return Ok(());
+    }
+
+    registry.append_console_message(server.id, "system", "Sending graceful stop command...")?;
+
+    let stop_command = server.cargo.config_stop.trim();
+    if !stop_command.is_empty() {
+        let _ = docker_command()
+            .arg("exec")
+            .arg(runtime_container_name(server.id))
+            .arg("sh")
+            .arg("-lc")
+            .arg(stop_command)
+            .output()
+            .await;
+    }
+
+    for _ in 0..15 {
+        if !container_is_running(server.id).await? {
+            remove_runtime_and_install_containers(server.id).await?;
+            registry.set_server_runtime(server.id, "offline", None, None)?;
+            registry.append_console_message(server.id, "system", "Server stopped successfully.")?;
+            return Ok(());
+        }
+
+        time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let output = docker_command()
+        .arg("stop")
+        .arg("-t")
+        .arg("10")
+        .arg(runtime_container_name(server.id))
+        .output()
+        .await
+        .context("failed to issue docker stop")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            bail!(stderr);
+        }
+    }
+
+    remove_runtime_and_install_containers(server.id).await?;
+    registry.set_server_runtime(server.id, "offline", None, None)?;
+    registry.append_console_message(server.id, "system", "Server stopped successfully.")?;
+
+    Ok(())
+}
+
+async fn kill_server(registry: &ServerRegistry, server: &ManagedServerRecord) -> Result<()> {
+    if !container_is_running(server.id).await? {
+        registry.set_server_runtime(server.id, "offline", None, None)?;
+        registry.append_console_message(
+            server.id,
+            "system",
+            "Kill requested, but the server was already offline.",
+        )?;
+        return Ok(());
+    }
+
+    let output = docker_command()
+        .arg("kill")
+        .arg(runtime_container_name(server.id))
+        .output()
+        .await
+        .context("failed to issue docker kill")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            bail!(stderr);
+        }
+    }
+
+    remove_runtime_and_install_containers(server.id).await?;
+    registry.set_server_runtime(server.id, "offline", None, None)?;
+    registry.append_console_message(server.id, "system", "Server killed successfully.")?;
+
+    Ok(())
+}
+
+async fn clear_server_volume(server: &ManagedServerRecord) -> Result<()> {
+    let volume_path = resolve_volume_path(server)?;
+
+    if tokio::fs::try_exists(&volume_path)
+        .await
+        .context("failed to inspect server volume path")?
+    {
+        tokio::fs::remove_dir_all(&volume_path)
+            .await
+            .with_context(|| format!("failed to remove {}", volume_path.display()))?;
+    }
+
+    tokio::fs::create_dir_all(&volume_path)
+        .await
+        .with_context(|| format!("failed to recreate {}", volume_path.display()))?;
+
+    Ok(())
+}
+
+fn load_managed_server(
+    registry: &ServerRegistry,
+    config: &DaemonConfig,
+    server_id: u64,
+) -> std::result::Result<ManagedServerRecord, (StatusCode, Json<ApiErrorResponse>)> {
+    let configured_node_id = config.panel.node_id.ok_or_else(|| {
+        error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "This daemon is not enrolled to a node yet.".to_string(),
+        )
+    })?;
+
+    let server = registry
+        .get_server(server_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "The requested server could not be found.".to_string(),
+            )
+        })?;
+
+    if server.node_id != configured_node_id {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The server does not belong to this node.".to_string(),
+        ));
+    }
+
+    Ok(server)
+}
+
 fn ensure_compatible_request(
     config: &DaemonConfig,
     request_uuid: &str,
@@ -530,6 +983,89 @@ fn authorize_request(
     }
 
     Ok(())
+}
+
+fn authorize_query(
+    config: &DaemonConfig,
+    query: &WsAuthorizationQuery,
+) -> std::result::Result<(), (StatusCode, Json<ApiErrorResponse>)> {
+    let expected = config
+        .panel
+        .daemon_callback_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "Missing daemon callback token.".to_string(),
+            )
+        })?;
+
+    if query.token.trim() != expected {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "The callback token is invalid.".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn container_is_running(server_id: u64) -> Result<bool> {
+    let output = docker_command()
+        .arg("inspect")
+        .arg("-f")
+        .arg("{{.State.Running}}")
+        .arg(runtime_container_name(server_id))
+        .output()
+        .await
+        .context("failed to inspect runtime container")?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+async fn remove_runtime_and_install_containers(server_id: u64) -> Result<()> {
+    remove_container(&runtime_container_name(server_id)).await?;
+    remove_container(&install_container_name(server_id)).await?;
+
+    Ok(())
+}
+
+async fn remove_container(name: &str) -> Result<()> {
+    let _ = docker_command()
+        .arg("rm")
+        .arg("-f")
+        .arg(name)
+        .output()
+        .await;
+
+    Ok(())
+}
+
+fn runtime_container_name(server_id: u64) -> String {
+    format!("skyport-server-{server_id}")
+}
+
+fn install_container_name(server_id: u64) -> String {
+    format!("skyport-install-{server_id}")
+}
+
+fn docker_command() -> Command {
+    let mut command = Command::new("docker");
+    command.kill_on_drop(true);
+    command
+}
+
+fn resolve_volume_path(server: &ManagedServerRecord) -> Result<PathBuf> {
+    Ok(project_root()?.join(&server.volume_path))
+}
+
+fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ApiErrorResponse>) {
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ApiErrorResponse>) {

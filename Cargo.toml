@@ -6,7 +6,7 @@ rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0.98"
-axum = { version = "0.8.4", features = ["json"] }
+axum = { version = "0.8.4", features = ["json", "ws"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"] }
 config = { version = "0.15.22", default-features = false, features = ["toml"] }
 hostname = "0.4.1"
