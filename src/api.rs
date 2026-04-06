@@ -273,14 +273,7 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
         .route("/api/daemon/servers/sync", post(sync_server))
         .route("/api/daemon/servers/{server_id}", delete(delete_server))
         .route("/api/daemon/servers/{server_id}/power", post(power_server))
-        .route(
-            "/api/daemon/servers/{server_id}/ws/console",
-            get(console_ws),
-        )
-        .route(
-            "/api/daemon/servers/{server_id}/ws/resources",
-            get(resources_ws),
-        )
+        .route("/api/daemon/servers/{server_id}/ws", get(server_ws))
         .with_state(state);
     let server_handle = handle.clone();
     let server_spec = spec.clone();
@@ -613,7 +606,7 @@ async fn power_server(
     Ok(Json(ApiSuccessResponse { ok: true }))
 }
 
-async fn console_ws(
+async fn server_ws(
     ws: WebSocketUpgrade,
     Path(server_id): Path<u64>,
     Query(query): Query<WsAuthorizationQuery>,
@@ -625,42 +618,69 @@ async fn console_ws(
     ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
     load_managed_server(&state.server_registry, &config, server_id)?;
 
-    Ok(ws.on_upgrade(move |socket| handle_console_ws(socket, state.server_registry, server_id)))
+    Ok(ws.on_upgrade(move |socket| handle_server_ws(socket, state.server_registry, server_id)))
 }
 
-async fn resources_ws(
-    ws: WebSocketUpgrade,
-    Path(server_id): Path<u64>,
-    Query(query): Query<WsAuthorizationQuery>,
-    State(state): State<ApiState>,
-) -> std::result::Result<Response, (StatusCode, Json<ApiErrorResponse>)> {
-    let config = state.config_rx.borrow().clone();
+async fn handle_server_ws(mut socket: WebSocket, registry: ServerRegistry, server_id: u64) {
+    if send_ws_event(&mut socket, "auth success", Vec::new())
+        .await
+        .is_err()
+    {
+        return;
+    }
 
-    authorize_query(&config, &query)?;
-    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
-    load_managed_server(&state.server_registry, &config, server_id)?;
-
-    Ok(ws.on_upgrade(move |socket| handle_resources_ws(socket, state.server_registry, server_id)))
-}
-
-async fn handle_console_ws(mut socket: WebSocket, registry: ServerRegistry, server_id: u64) {
     let mut last_id = 0_u64;
+    let mut last_status: Option<String> = None;
+
+    if let Ok(Some(server)) = registry.get_server(server_id) {
+        last_status = Some(server.status.clone());
+
+        if send_status_event(&mut socket, &server.status)
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let payload = match current_resource_snapshot(&server).await {
+            Ok(payload) => payload,
+            Err(error) => json!({
+                "server": server_id,
+                "running": false,
+                "state": server.status,
+                "error": error.to_string(),
+            }),
+        };
+
+        if send_ws_event(&mut socket, "stats", vec![payload])
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 
     if let Ok(backlog) = registry.console_messages_since(server_id, 0, 200) {
         for message in backlog {
             last_id = message.id;
-            if send_console_message(&mut socket, &message).await.is_err() {
+            if send_console_event(&mut socket, &message).await.is_err() {
                 return;
             }
         }
     }
 
-    let mut interval = time::interval(Duration::from_millis(500));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut console_interval = time::interval(Duration::from_millis(500));
+    console_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut stats_interval = time::interval(Duration::from_secs(2));
+    stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut status_interval = time::interval(Duration::from_millis(500));
+    status_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
+            _ = console_interval.tick() => {
                 let messages = match registry.console_messages_since(server_id, last_id, 200) {
                     Ok(messages) => messages,
                     Err(_) => break,
@@ -668,7 +688,41 @@ async fn handle_console_ws(mut socket: WebSocket, registry: ServerRegistry, serv
 
                 for message in messages {
                     last_id = message.id;
-                    if send_console_message(&mut socket, &message).await.is_err() {
+                    if send_console_event(&mut socket, &message).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            _ = stats_interval.tick() => {
+                let server = match registry.get_server(server_id) {
+                    Ok(Some(server)) => server,
+                    _ => return,
+                };
+
+                let payload = match current_resource_snapshot(&server).await {
+                    Ok(payload) => payload,
+                    Err(error) => json!({
+                        "server": server_id,
+                        "running": false,
+                        "state": server.status,
+                        "error": error.to_string(),
+                    }),
+                };
+
+                if send_ws_event(&mut socket, "stats", vec![payload]).await.is_err() {
+                    return;
+                }
+            }
+            _ = status_interval.tick() => {
+                let server = match registry.get_server(server_id) {
+                    Ok(Some(server)) => server,
+                    _ => return,
+                };
+
+                if last_status.as_deref() != Some(server.status.as_str()) {
+                    last_status = Some(server.status.clone());
+
+                    if send_status_event(&mut socket, &server.status).await.is_err() {
                         return;
                     }
                 }
@@ -681,6 +735,7 @@ async fn handle_console_ws(mut socket: WebSocket, registry: ServerRegistry, serv
                             return;
                         }
                     }
+                    Some(Ok(Message::Text(_))) => {}
                     Some(Err(_)) => return,
                     _ => {}
                 }
@@ -689,67 +744,40 @@ async fn handle_console_ws(mut socket: WebSocket, registry: ServerRegistry, serv
     }
 }
 
-async fn handle_resources_ws(mut socket: WebSocket, registry: ServerRegistry, server_id: u64) {
-    let mut interval = time::interval(Duration::from_secs(2));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let server = match registry.get_server(server_id) {
-                    Ok(Some(server)) => server,
-                    _ => return,
-                };
-
-                let payload = match current_resource_snapshot(&server).await {
-                    Ok(payload) => payload,
-                    Err(error) => json!({
-                        "type": "resources",
-                        "server_id": server_id,
-                        "running": false,
-                        "error": error.to_string(),
-                    }),
-                };
-
-                if socket.send(Message::Text(payload.to_string().into())).await.is_err() {
-                    return;
-                }
-            }
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(Message::Close(_))) | None => return,
-                    Some(Ok(Message::Ping(payload))) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some(Err(_)) => return,
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
-async fn send_console_message(
-    socket: &mut WebSocket,
-    message: &ConsoleMessageRecord,
-) -> Result<()> {
+async fn send_ws_event(socket: &mut WebSocket, event: &str, args: Vec<Value>) -> Result<()> {
     socket
-        .send(Message::Text(
-            json!({
-                "type": "console",
-                "id": message.id,
-                "server_id": message.server_id,
-                "source": message.source,
-                "message": message.message,
-                "created_at": message.created_at,
-            })
-            .to_string()
-            .into(),
-        ))
+        .send(Message::Text(ws_event_payload(event, args).into()))
         .await
-        .context("failed to send console websocket message")
+        .with_context(|| format!("failed to send {event} websocket event"))
+}
+
+async fn send_status_event(socket: &mut WebSocket, status: &str) -> Result<()> {
+    send_ws_event(socket, "status", vec![Value::String(status.to_string())]).await
+}
+
+async fn send_console_event(socket: &mut WebSocket, message: &ConsoleMessageRecord) -> Result<()> {
+    send_ws_event(
+        socket,
+        console_event_name(&message.source),
+        vec![Value::String(message.message.clone())],
+    )
+    .await
+}
+
+fn ws_event_payload(event: &str, args: Vec<Value>) -> String {
+    json!({
+        "event": event,
+        "args": args,
+    })
+    .to_string()
+}
+
+fn console_event_name(source: &str) -> &'static str {
+    if source == "install" {
+        "install output"
+    } else {
+        "console output"
+    }
 }
 
 async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
@@ -766,20 +794,18 @@ async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value
 
     if !output.status.success() {
         return Ok(json!({
-            "type": "resources",
-            "server_id": server.id,
+            "server": server.id,
             "running": false,
-            "status": server.status,
+            "state": server.status,
         }));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
         return Ok(json!({
-            "type": "resources",
-            "server_id": server.id,
+            "server": server.id,
             "running": false,
-            "status": server.status,
+            "state": server.status,
         }));
     }
 
@@ -787,10 +813,9 @@ async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value
         serde_json::from_str(&stdout).context("failed to parse docker stats payload")?;
 
     Ok(json!({
-        "type": "resources",
-        "server_id": server.id,
+        "server": server.id,
         "running": true,
-        "status": server.status,
+        "state": server.status,
         "stats": stats,
     }))
 }
@@ -1085,4 +1110,70 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ApiErrorResponse>) 
 
 fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ApiErrorResponse>) {
     (status, Json(ApiErrorResponse { message }))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn install_console_messages_use_install_output_events() {
+        let message = ConsoleMessageRecord {
+            id: 1,
+            server_id: 42,
+            source: "install".to_string(),
+            message: "Downloading files...".to_string(),
+            created_at: "2026-04-06T00:00:00Z".to_string(),
+        };
+
+        let payload = ws_event_payload(
+            console_event_name(&message.source),
+            vec![Value::String(message.message.clone())],
+        );
+
+        expect_json(
+            &payload,
+            json!({
+                "event": "install output",
+                "args": ["Downloading files..."],
+            }),
+        );
+    }
+
+    #[test]
+    fn non_install_console_messages_use_console_output_events() {
+        let payload = ws_event_payload(
+            console_event_name("stdout"),
+            vec![Value::String("Server started".to_string())],
+        );
+
+        expect_json(
+            &payload,
+            json!({
+                "event": "console output",
+                "args": ["Server started"],
+            }),
+        );
+    }
+
+    #[test]
+    fn status_events_use_wings_style_envelope() {
+        let payload = ws_event_payload("status", vec![Value::String("running".to_string())]);
+
+        expect_json(
+            &payload,
+            json!({
+                "event": "status",
+                "args": ["running"],
+            }),
+        );
+    }
+
+    fn expect_json(actual: &str, expected: Value) {
+        let parsed: Value = serde_json::from_str(actual).expect("valid websocket json");
+
+        assert_eq!(parsed, expected);
+    }
 }
