@@ -438,6 +438,16 @@ async fn sync_server(
         ));
     }
 
+    let existing = state
+        .server_registry
+        .get_server(payload.server.id)
+        .map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load existing server state: {error}"),
+            )
+        })?;
+
     let server = ManagedServerRecord {
         id: payload.server.id,
         node_id: payload.server.node_id,
@@ -495,6 +505,10 @@ async fn sync_server(
                 format!("failed to persist server state: {error}"),
             )
         })?;
+
+    handle_synced_server_update(&state.server_registry, existing.as_ref(), &server)
+        .await
+        .map_err(internal_error)?;
 
     info!(server_id = server.id, node_id = server.node_id, name = %server.name, "server state synced");
 
@@ -999,6 +1013,44 @@ fn console_event_name(source: &str) -> &'static str {
         "system" => "daemon message",
         _ => "console output",
     }
+}
+
+async fn handle_synced_server_update(
+    registry: &ServerRegistry,
+    existing: Option<&ManagedServerRecord>,
+    server: &ManagedServerRecord,
+) -> Result<()> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+
+    if !server_requires_recreate(existing, server) {
+        return Ok(());
+    }
+
+    if existing.status == "offline" {
+        remove_runtime_and_install_containers(server.id).await?;
+        registry.set_server_runtime(server.id, "offline", None, existing.last_error.as_deref())?;
+        registry.append_console_message(
+            server.id,
+            "system",
+            "Server settings were updated while offline. The container was removed and the new settings will apply on the next start.",
+        )?;
+
+        return Ok(());
+    }
+
+    registry.append_console_message(
+        server.id,
+        "system",
+        "Server settings were updated and queued. They will apply on the next restart or start.",
+    )?;
+
+    Ok(())
+}
+
+fn server_requires_recreate(existing: &ManagedServerRecord, server: &ManagedServerRecord) -> bool {
+    existing.limits != server.limits || existing.allocation != server.allocation
 }
 
 async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
@@ -1542,11 +1594,77 @@ mod tests {
         assert!(parse_power_signal(Some(&"reinstall".to_string())).is_err());
     }
 
+    #[test]
+    fn synced_server_recreate_detection_tracks_limits_and_allocations() {
+        let existing = sample_managed_server();
+        let mut updated_limits = sample_managed_server();
+        updated_limits.limits.memory_mib = 2048;
+        let mut updated_allocation = sample_managed_server();
+        updated_allocation.allocation.port = 25566;
+
+        assert!(server_requires_recreate(&existing, &updated_limits));
+        assert!(server_requires_recreate(&existing, &updated_allocation));
+        assert!(!server_requires_recreate(
+            &existing,
+            &sample_managed_server()
+        ));
+    }
+
     fn current_unix_timestamp() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("valid system time")
             .as_secs()
+    }
+
+    fn sample_managed_server() -> ManagedServerRecord {
+        ManagedServerRecord {
+            id: 1,
+            node_id: 1,
+            name: "Paper".to_string(),
+            status: "offline".to_string(),
+            volume_path: "volumes/1".to_string(),
+            created_at: "2026-04-06T00:00:00Z".to_string(),
+            updated_at: "2026-04-06T00:00:00Z".to_string(),
+            allocation: ManagedServerAllocation {
+                id: 1,
+                bind_ip: "0.0.0.0".to_string(),
+                port: 25565,
+                ip_alias: None,
+            },
+            container_id: None,
+            last_error: None,
+            user: ManagedServerUser {
+                id: 1,
+                name: "Test".to_string(),
+                email: "test@example.com".to_string(),
+            },
+            limits: ManagedServerLimits {
+                memory_mib: 1024,
+                cpu_limit: 100,
+                disk_mib: 10240,
+            },
+            cargo: ManagedServerCargo {
+                id: 1,
+                name: "Paper".to_string(),
+                slug: "paper".to_string(),
+                source_type: "pterodactyl".to_string(),
+                startup_command: "java -jar server.jar".to_string(),
+                config_files: "{}".to_string(),
+                config_startup: "{}".to_string(),
+                config_logs: "{}".to_string(),
+                config_stop: "stop".to_string(),
+                install_script: None,
+                install_container: None,
+                install_entrypoint: None,
+                features: vec![],
+                docker_images: BTreeMap::new(),
+                file_denylist: vec![],
+                file_hidden_list: vec![],
+                variables: vec![],
+                definition: Value::Null,
+            },
+        }
     }
 
     fn expect_json(actual: &str, expected: Value) {
