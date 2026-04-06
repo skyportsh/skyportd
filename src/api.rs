@@ -73,12 +73,18 @@ struct ServerPowerRequest {
 
 #[derive(Debug, Deserialize)]
 struct WsAuthorizationQuery {
-    token: String,
     uuid: String,
     panel_version: String,
 }
 
 #[derive(Debug, Deserialize)]
+struct WsClientEvent {
+    event: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PowerSignal {
     Start,
@@ -528,77 +534,9 @@ async fn power_server(
 
     let mut server = load_managed_server(&state.server_registry, &config, server_id)?;
 
-    match payload.signal {
-        PowerSignal::Start => {
-            if container_is_running(server.id)
-                .await
-                .map_err(internal_error)?
-            {
-                state
-                    .server_registry
-                    .append_console_message(
-                        server.id,
-                        "system",
-                        "Start requested, but the server is already running.",
-                    )
-                    .map_err(internal_error)?;
-            } else {
-                state
-                    .server_registry
-                    .set_server_runtime(server.id, "offline", None, None)
-                    .map_err(internal_error)?;
-                state
-                    .server_registry
-                    .append_console_message(
-                        server.id,
-                        "system",
-                        "Start requested. The server will be booted by the lifecycle worker.",
-                    )
-                    .map_err(internal_error)?;
-            }
-        }
-        PowerSignal::Stop => {
-            graceful_stop(&state.server_registry, &server)
-                .await
-                .map_err(internal_error)?;
-        }
-        PowerSignal::Restart => {
-            graceful_stop(&state.server_registry, &server)
-                .await
-                .map_err(internal_error)?;
-            state
-                .server_registry
-                .set_server_runtime(server.id, "offline", None, None)
-                .map_err(internal_error)?;
-            state
-                .server_registry
-                .append_console_message(
-                    server.id,
-                    "system",
-                    "Restart requested. The server will be started again by the lifecycle worker.",
-                )
-                .map_err(internal_error)?;
-        }
-        PowerSignal::Kill => {
-            kill_server(&state.server_registry, &server)
-                .await
-                .map_err(internal_error)?;
-        }
-        PowerSignal::Reinstall => {
-            remove_runtime_and_install_containers(server.id)
-                .await
-                .map_err(internal_error)?;
-            clear_server_volume(&server).await.map_err(internal_error)?;
-            state
-                .server_registry
-                .set_server_runtime(server.id, "pending", None, None)
-                .map_err(internal_error)?;
-            state
-                .server_registry
-                .append_console_message(server.id, "system", "Reinstall requested. Existing files were cleared and the lifecycle worker will reinstall the server.")
-                .map_err(internal_error)?;
-        }
-    }
+    apply_power_signal(&state.server_registry, &server, payload.signal)
+        .await
+        .map_err(internal_error)?;
 
     server = load_managed_server(&state.server_registry, &config, server_id)?;
     info!(server_id = server.id, status = %server.status, "power action processed");
@@ -614,60 +552,29 @@ async fn server_ws(
 ) -> std::result::Result<Response, (StatusCode, Json<ApiErrorResponse>)> {
     let config = state.config_rx.borrow().clone();
 
-    authorize_query(&config, &query)?;
     ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
     load_managed_server(&state.server_registry, &config, server_id)?;
 
-    Ok(ws.on_upgrade(move |socket| handle_server_ws(socket, state.server_registry, server_id)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_server_ws(
+            socket,
+            state.server_registry,
+            server_id,
+            config.panel.daemon_callback_token,
+        )
+    }))
 }
 
-async fn handle_server_ws(mut socket: WebSocket, registry: ServerRegistry, server_id: u64) {
-    if send_ws_event(&mut socket, "auth success", Vec::new())
-        .await
-        .is_err()
-    {
-        return;
-    }
-
+async fn handle_server_ws(
+    mut socket: WebSocket,
+    registry: ServerRegistry,
+    server_id: u64,
+    expected_token: Option<String>,
+) {
+    let mut authenticated = false;
+    let mut stats_subscribed = false;
     let mut last_id = 0_u64;
     let mut last_status: Option<String> = None;
-
-    if let Ok(Some(server)) = registry.get_server(server_id) {
-        last_status = Some(server.status.clone());
-
-        if send_status_event(&mut socket, &server.status)
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        let payload = match current_resource_snapshot(&server).await {
-            Ok(payload) => payload,
-            Err(error) => json!({
-                "server": server_id,
-                "running": false,
-                "state": server.status,
-                "error": error.to_string(),
-            }),
-        };
-
-        if send_ws_event(&mut socket, "stats", vec![payload])
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-
-    if let Ok(backlog) = registry.console_messages_since(server_id, 0, 200) {
-        for message in backlog {
-            last_id = message.id;
-            if send_console_event(&mut socket, &message).await.is_err() {
-                return;
-            }
-        }
-    }
 
     let mut console_interval = time::interval(Duration::from_millis(500));
     console_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -680,7 +587,7 @@ async fn handle_server_ws(mut socket: WebSocket, registry: ServerRegistry, serve
 
     loop {
         tokio::select! {
-            _ = console_interval.tick() => {
+            _ = console_interval.tick(), if authenticated => {
                 let messages = match registry.console_messages_since(server_id, last_id, 200) {
                     Ok(messages) => messages,
                     Err(_) => break,
@@ -693,36 +600,30 @@ async fn handle_server_ws(mut socket: WebSocket, registry: ServerRegistry, serve
                     }
                 }
             }
-            _ = stats_interval.tick() => {
+            _ = stats_interval.tick(), if authenticated && stats_subscribed => {
                 let server = match registry.get_server(server_id) {
                     Ok(Some(server)) => server,
                     _ => return,
                 };
 
-                let payload = match current_resource_snapshot(&server).await {
-                    Ok(payload) => payload,
-                    Err(error) => json!({
-                        "server": server_id,
-                        "running": false,
-                        "state": server.status,
-                        "error": error.to_string(),
-                    }),
-                };
-
-                if send_ws_event(&mut socket, "stats", vec![payload]).await.is_err() {
+                if send_stats_event(&mut socket, &server).await.is_err() {
                     return;
                 }
             }
-            _ = status_interval.tick() => {
+            _ = status_interval.tick(), if authenticated => {
                 let server = match registry.get_server(server_id) {
                     Ok(Some(server)) => server,
                     _ => return,
                 };
 
                 if last_status.as_deref() != Some(server.status.as_str()) {
-                    last_status = Some(server.status.clone());
+                    let previous_status = last_status.replace(server.status.clone());
 
                     if send_status_event(&mut socket, &server.status).await.is_err() {
+                        return;
+                    }
+
+                    if send_install_state_event(&mut socket, previous_status.as_deref(), &server.status).await.is_err() {
                         return;
                     }
                 }
@@ -735,7 +636,66 @@ async fn handle_server_ws(mut socket: WebSocket, registry: ServerRegistry, serve
                             return;
                         }
                     }
-                    Some(Ok(Message::Text(_))) => {}
+                    Some(Ok(Message::Text(payload))) => {
+                        let event = match parse_ws_client_event(payload.as_str()) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                if send_ws_event(&mut socket, "daemon error", vec![Value::String(error.to_string())]).await.is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
+
+                        if event.event == "auth" {
+                            match authenticate_ws_event(&expected_token, &event) {
+                                Ok(()) => {
+                                    authenticated = true;
+
+                                    if send_ws_event(&mut socket, "auth success", Vec::new()).await.is_err() {
+                                        return;
+                                    }
+
+                                    if let Ok(Some(server)) = registry.get_server(server_id) {
+                                        last_status = Some(server.status.clone());
+
+                                        if send_status_event(&mut socket, &server.status).await.is_err() {
+                                            return;
+                                        }
+                                    }
+
+                                    if let Ok(backlog) = registry.console_messages_since(server_id, 0, 200) {
+                                        for message in backlog {
+                                            last_id = last_id.max(message.id);
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    if send_ws_event(&mut socket, "jwt error", vec![Value::String(error.to_string())]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+
+                            continue;
+                        }
+
+                        if !authenticated {
+                            if send_ws_event(&mut socket, "jwt error", vec![Value::String("You must authenticate the websocket before sending commands.".to_string())]).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        match handle_ws_client_event(&registry, server_id, &mut socket, event, &mut stats_subscribed, &mut last_id).await {
+                            Ok(()) => {}
+                            Err(error) => {
+                                if send_ws_event(&mut socket, "daemon error", vec![Value::String(error.to_string())]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     Some(Err(_)) => return,
                     _ => {}
                 }
@@ -762,6 +722,144 @@ async fn send_console_event(socket: &mut WebSocket, message: &ConsoleMessageReco
         vec![Value::String(message.message.clone())],
     )
     .await
+}
+
+async fn send_stats_event(socket: &mut WebSocket, server: &ManagedServerRecord) -> Result<()> {
+    let payload = match current_resource_snapshot(server).await {
+        Ok(payload) => payload,
+        Err(error) => json!({
+            "server": server.id,
+            "running": false,
+            "state": server.status,
+            "error": error.to_string(),
+        }),
+    };
+
+    send_ws_event(socket, "stats", vec![payload]).await
+}
+
+async fn send_install_state_event(
+    socket: &mut WebSocket,
+    previous_status: Option<&str>,
+    current_status: &str,
+) -> Result<()> {
+    if current_status == "installing" && previous_status != Some("installing") {
+        return send_ws_event(socket, "install started", Vec::new()).await;
+    }
+
+    if previous_status == Some("installing") && current_status != "installing" {
+        return send_ws_event(socket, "install completed", Vec::new()).await;
+    }
+
+    Ok(())
+}
+
+async fn handle_ws_client_event(
+    registry: &ServerRegistry,
+    server_id: u64,
+    socket: &mut WebSocket,
+    event: WsClientEvent,
+    stats_subscribed: &mut bool,
+    last_id: &mut u64,
+) -> Result<()> {
+    let server = registry
+        .get_server(server_id)?
+        .context("The requested server could not be found.")?;
+
+    match event.event.as_str() {
+        "send logs" => {
+            let backlog = registry.console_messages_since(server_id, 0, 200)?;
+
+            for message in backlog {
+                *last_id = (*last_id).max(message.id);
+                send_console_event(socket, &message).await?;
+            }
+        }
+        "send stats" => {
+            *stats_subscribed = true;
+            send_stats_event(socket, &server).await?;
+        }
+        "set state" => {
+            let signal = parse_power_signal(event.args.first())?;
+            apply_power_signal(registry, &server, signal).await?;
+            send_ws_event(
+                socket,
+                "daemon message",
+                vec![Value::String(format!(
+                    "Accepted power action: {}.",
+                    power_signal_name(signal)
+                ))],
+            )
+            .await?;
+        }
+        "send command" => {
+            let command = event
+                .args
+                .first()
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .context("The send command event requires a command string.")?;
+
+            send_command_to_server(registry, &server, command).await?;
+            send_ws_event(
+                socket,
+                "daemon message",
+                vec![Value::String(
+                    "Command forwarded to the server process.".to_string(),
+                )],
+            )
+            .await?;
+        }
+        _ => {
+            bail!("Unsupported websocket event: {}", event.event);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_ws_client_event(payload: &str) -> Result<WsClientEvent> {
+    serde_json::from_str::<WsClientEvent>(payload).context("Invalid websocket payload.")
+}
+
+fn authenticate_ws_event(expected_token: &Option<String>, event: &WsClientEvent) -> Result<()> {
+    let expected = expected_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .context("Missing daemon callback token.")?;
+    let provided = event
+        .args
+        .first()
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("The auth event requires a token.")?;
+
+    if provided != expected {
+        bail!("The callback token is invalid.");
+    }
+
+    Ok(())
+}
+
+fn parse_power_signal(signal: Option<&String>) -> Result<PowerSignal> {
+    match signal.map(String::as_str) {
+        Some("start") => Ok(PowerSignal::Start),
+        Some("stop") => Ok(PowerSignal::Stop),
+        Some("restart") => Ok(PowerSignal::Restart),
+        Some("kill") => Ok(PowerSignal::Kill),
+        Some(value) => bail!("Unsupported power state: {value}"),
+        None => bail!("The set state event requires a power state."),
+    }
+}
+
+fn power_signal_name(signal: PowerSignal) -> &'static str {
+    match signal {
+        PowerSignal::Start => "start",
+        PowerSignal::Stop => "stop",
+        PowerSignal::Restart => "restart",
+        PowerSignal::Kill => "kill",
+        PowerSignal::Reinstall => "reinstall",
+    }
 }
 
 fn ws_event_payload(event: &str, args: Vec<Value>) -> String {
@@ -818,6 +916,98 @@ async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value
         "state": server.status,
         "stats": stats,
     }))
+}
+
+async fn apply_power_signal(
+    registry: &ServerRegistry,
+    server: &ManagedServerRecord,
+    signal: PowerSignal,
+) -> Result<()> {
+    match signal {
+        PowerSignal::Start => {
+            if container_is_running(server.id).await? {
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Start requested, but the server is already running.",
+                )?;
+            } else {
+                registry.set_server_runtime(server.id, "offline", None, None)?;
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Start requested. The server will be booted by the lifecycle worker.",
+                )?;
+            }
+        }
+        PowerSignal::Stop => {
+            graceful_stop(registry, server).await?;
+        }
+        PowerSignal::Restart => {
+            graceful_stop(registry, server).await?;
+            registry.set_server_runtime(server.id, "offline", None, None)?;
+            registry.append_console_message(
+                server.id,
+                "system",
+                "Restart requested. The server will be started again by the lifecycle worker.",
+            )?;
+        }
+        PowerSignal::Kill => {
+            kill_server(registry, server).await?;
+        }
+        PowerSignal::Reinstall => {
+            remove_runtime_and_install_containers(server.id).await?;
+            clear_server_volume(server).await?;
+            registry.set_server_runtime(server.id, "pending", None, None)?;
+            registry.append_console_message(
+                server.id,
+                "system",
+                "Reinstall requested. Existing files were cleared and the lifecycle worker will reinstall the server.",
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_command_to_server(
+    registry: &ServerRegistry,
+    server: &ManagedServerRecord,
+    command: &str,
+) -> Result<()> {
+    if !container_is_running(server.id).await? {
+        bail!("The server is not running.");
+    }
+
+    let output = docker_command()
+        .arg("exec")
+        .arg("-e")
+        .arg(format!("SKYPORT_SERVER_COMMAND={command}"))
+        .arg(runtime_container_name(server.id))
+        .arg("sh")
+        .arg("-lc")
+        .arg("printf '%s\\n' \"$SKYPORT_SERVER_COMMAND\" > /proc/1/fd/0")
+        .output()
+        .await
+        .context("failed to forward command to the runtime container")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        if stderr.is_empty() {
+            bail!("Failed to send the command to the server process.");
+        }
+
+        bail!("Failed to send the command to the server process: {stderr}");
+    }
+
+    registry.append_console_message(
+        server.id,
+        "system",
+        &format!("Console command sent: {command}"),
+    )?;
+
+    Ok(())
 }
 
 async fn graceful_stop(registry: &ServerRegistry, server: &ManagedServerRecord) -> Result<()> {
@@ -1025,32 +1215,6 @@ fn authorize_request(
     Ok(())
 }
 
-fn authorize_query(
-    config: &DaemonConfig,
-    query: &WsAuthorizationQuery,
-) -> std::result::Result<(), (StatusCode, Json<ApiErrorResponse>)> {
-    let expected = config
-        .panel
-        .daemon_callback_token
-        .as_deref()
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "Missing daemon callback token.".to_string(),
-            )
-        })?;
-
-    if query.token.trim() != expected {
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "The callback token is invalid.".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
 async fn container_is_running(server_id: u64) -> Result<bool> {
     let output = docker_command()
         .arg("inspect")
@@ -1169,6 +1333,39 @@ mod tests {
                 "args": ["running"],
             }),
         );
+    }
+
+    #[test]
+    fn websocket_client_payloads_parse_like_wings_events() {
+        let event = parse_ws_client_event(r#"{"event":"set state","args":["restart"]}"#)
+            .expect("valid websocket payload");
+
+        assert_eq!(event.event, "set state");
+        assert_eq!(event.args, vec!["restart"]);
+    }
+
+    #[test]
+    fn auth_event_requires_matching_token() {
+        let event = WsClientEvent {
+            event: "auth".to_string(),
+            args: vec!["callback-token".to_string()],
+        };
+
+        assert!(authenticate_ws_event(&Some("callback-token".to_string()), &event).is_ok());
+        assert!(authenticate_ws_event(&Some("other-token".to_string()), &event).is_err());
+    }
+
+    #[test]
+    fn set_state_accepts_only_supported_power_actions() {
+        assert!(matches!(
+            parse_power_signal(Some(&"start".to_string())).expect("start accepted"),
+            PowerSignal::Start
+        ));
+        assert!(matches!(
+            parse_power_signal(Some(&"kill".to_string())).expect("kill accepted"),
+            PowerSignal::Kill
+        ));
+        assert!(parse_power_signal(Some(&"reinstall".to_string())).is_err());
     }
 
     fn expect_json(actual: &str, expected: Value) {
