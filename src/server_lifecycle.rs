@@ -116,8 +116,8 @@ async fn should_reconcile(server: &ManagedServerRecord, config: &DaemonConfig) -
     }
 
     match server.status.as_str() {
-        "pending" | "starting" | "running" => true,
-        "offline" => server.last_error.is_none(),
+        "pending" | "starting" | "running" | "stopping" | "restarting" => true,
+        "offline" => false,
         "installing" => true,
         "install_failed" => false,
         _ => true,
@@ -145,8 +145,19 @@ async fn reconcile_server(
         "pending" | "installing" => {
             provision_and_install(&registry, &mut server, &config, &cancellation).await?;
         }
-        "offline" | "starting" | "running" => {
+        "starting" | "running" => {
             if !runtime_container_is_running(&server).await? {
+                boot_server(&registry, &mut server, &config, &cancellation).await?;
+            }
+        }
+        "stopping" => {
+            if !runtime_container_is_running(&server).await? {
+                set_runtime_state(&registry, &config, server.id, "offline", None, None).await?;
+            }
+        }
+        "restarting" => {
+            if !runtime_container_is_running(&server).await? {
+                server.status = "offline".to_string();
                 boot_server(&registry, &mut server, &config, &cancellation).await?;
             }
         }

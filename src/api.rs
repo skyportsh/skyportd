@@ -1108,7 +1108,7 @@ async fn apply_power_signal(
                     "Start requested, but the server is already running.",
                 )?;
             } else {
-                registry.set_server_runtime(server.id, "offline", None, None)?;
+                registry.set_server_runtime(server.id, "starting", None, None)?;
                 registry.append_console_message(
                     server.id,
                     "system",
@@ -1117,16 +1117,74 @@ async fn apply_power_signal(
             }
         }
         PowerSignal::Stop => {
-            graceful_stop(registry, server).await?;
+            if !container_is_running(server.id).await? {
+                registry.set_server_runtime(server.id, "offline", None, None)?;
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Stop requested, but the server was already offline.",
+                )?;
+            } else {
+                registry.set_server_runtime(server.id, "stopping", None, None)?;
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Stop requested. The server is shutting down.",
+                )?;
+
+                let registry = registry.clone();
+                let server = server.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = graceful_stop(&registry, &server, "offline").await {
+                        let _ = registry.set_server_runtime(
+                            server.id,
+                            "running",
+                            None,
+                            Some(&error.to_string()),
+                        );
+                        let _ = registry.append_console_message(
+                            server.id,
+                            "system",
+                            &format!("Stop failed: {error}"),
+                        );
+                    }
+                });
+            }
         }
         PowerSignal::Restart => {
-            graceful_stop(registry, server).await?;
-            registry.set_server_runtime(server.id, "offline", None, None)?;
-            registry.append_console_message(
-                server.id,
-                "system",
-                "Restart requested. The server will be started again by the lifecycle worker.",
-            )?;
+            if !container_is_running(server.id).await? {
+                registry.set_server_runtime(server.id, "starting", None, None)?;
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Restart requested while offline. The server will be started by the lifecycle worker.",
+                )?;
+            } else {
+                registry.set_server_runtime(server.id, "restarting", None, None)?;
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Restart requested. The server is shutting down before restart.",
+                )?;
+
+                let registry = registry.clone();
+                let server = server.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = graceful_stop(&registry, &server, "restarting").await {
+                        let _ = registry.set_server_runtime(
+                            server.id,
+                            "running",
+                            None,
+                            Some(&error.to_string()),
+                        );
+                        let _ = registry.append_console_message(
+                            server.id,
+                            "system",
+                            &format!("Restart failed: {error}"),
+                        );
+                    }
+                });
+            }
         }
         PowerSignal::Kill => {
             kill_server(registry, server).await?;
@@ -1186,7 +1244,11 @@ async fn send_command_to_server(
     Ok(())
 }
 
-async fn graceful_stop(registry: &ServerRegistry, server: &ManagedServerRecord) -> Result<()> {
+async fn graceful_stop(
+    registry: &ServerRegistry,
+    server: &ManagedServerRecord,
+    final_status: &str,
+) -> Result<()> {
     if !container_is_running(server.id).await? {
         registry.set_server_runtime(server.id, "offline", None, None)?;
         registry.append_console_message(
@@ -1200,26 +1262,40 @@ async fn graceful_stop(registry: &ServerRegistry, server: &ManagedServerRecord) 
     registry.append_console_message(server.id, "system", "Sending graceful stop command...")?;
 
     let stop_command = server.cargo.config_stop.trim();
+    let mut graceful_command_sent = false;
+
     if !stop_command.is_empty() {
-        let _ = docker_command()
-            .arg("exec")
-            .arg(runtime_container_name(server.id))
-            .arg("sh")
-            .arg("-lc")
-            .arg(stop_command)
-            .output()
-            .await;
+        match send_command_to_server(registry, server, stop_command).await {
+            Ok(()) => {
+                graceful_command_sent = true;
+            }
+            Err(error) => {
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    &format!(
+                        "Failed to send graceful stop command. Falling back to docker stop: {error}"
+                    ),
+                )?;
+            }
+        }
     }
 
-    for _ in 0..15 {
-        if !container_is_running(server.id).await? {
-            remove_runtime_and_install_containers(server.id).await?;
-            registry.set_server_runtime(server.id, "offline", None, None)?;
-            registry.append_console_message(server.id, "system", "Server stopped successfully.")?;
-            return Ok(());
-        }
+    if graceful_command_sent {
+        for _ in 0..15 {
+            if !container_is_running(server.id).await? {
+                remove_runtime_and_install_containers(server.id).await?;
+                registry.set_server_runtime(server.id, final_status, None, None)?;
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    stop_completion_message(final_status),
+                )?;
+                return Ok(());
+            }
 
-        time::sleep(Duration::from_secs(1)).await;
+            time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     let output = docker_command()
@@ -1239,10 +1315,17 @@ async fn graceful_stop(registry: &ServerRegistry, server: &ManagedServerRecord) 
     }
 
     remove_runtime_and_install_containers(server.id).await?;
-    registry.set_server_runtime(server.id, "offline", None, None)?;
-    registry.append_console_message(server.id, "system", "Server stopped successfully.")?;
+    registry.set_server_runtime(server.id, final_status, None, None)?;
+    registry.append_console_message(server.id, "system", stop_completion_message(final_status))?;
 
     Ok(())
+}
+
+fn stop_completion_message(final_status: &str) -> &'static str {
+    match final_status {
+        "restarting" => "Server stopped successfully. Restart pending.",
+        _ => "Server stopped successfully.",
+    }
 }
 
 async fn kill_server(registry: &ServerRegistry, server: &ManagedServerRecord) -> Result<()> {
