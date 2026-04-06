@@ -81,20 +81,19 @@ impl ServerLifecycleService {
                             let server_id = server.id;
                             if let Err(error) = reconcile_server(registry.clone(), server, config.clone(), cancellation).await {
                                 warn!(server_id, error = %error, "server reconciliation failed");
-                                let _ = registry.set_server_runtime(
+                                let _ = set_runtime_state(
+                                    &registry,
+                                    &config,
                                     server_id,
                                     "install_failed",
                                     None,
                                     Some(&error.to_string()),
-                                );
+                                ).await;
                                 let _ = registry.append_console_message(
                                     server_id,
                                     "system",
                                     &format!("Reconciliation failed: {error}"),
                                 );
-                                if let Err(callback_error) = notify_panel_install_failure(&config, server_id, &error.to_string()).await {
-                                    warn!(server_id, error = %callback_error, "failed to notify panel about install failure");
-                                }
                             }
 
                             active.lock().await.remove(&server_id);
@@ -164,7 +163,7 @@ async fn provision_and_install(
     let install_log_path = volume_path.join("install.log");
     reset_install_log(&install_log_path)?;
 
-    registry.set_server_runtime(server.id, "installing", None, None)?;
+    set_runtime_state(registry, config, server.id, "installing", None, None).await?;
     registry.append_console_message(server.id, "system", "Preparing volume directory...")?;
     append_install_log(&install_log_path, "system", "Preparing volume directory...")?;
 
@@ -194,7 +193,7 @@ async fn provision_and_install(
             "system",
             "No install container configured. Skipping installation.",
         )?;
-        registry.set_server_runtime(server.id, "offline", None, None)?;
+        set_runtime_state(registry, config, server.id, "offline", None, None).await?;
         server.status = "offline".to_string();
 
         return boot_server(registry, server, config, cancellation).await;
@@ -254,7 +253,15 @@ async fn provision_and_install(
         let message = format!("Installation failed with exit code {code}.");
         registry.append_console_message(server.id, "system", &message)?;
         append_install_log(&install_log_path, "system", &message)?;
-        registry.set_server_runtime(server.id, "install_failed", None, Some(&message))?;
+        set_runtime_state(
+            registry,
+            config,
+            server.id,
+            "install_failed",
+            None,
+            Some(&message),
+        )
+        .await?;
         bail!(message);
     }
 
@@ -264,7 +271,7 @@ async fn provision_and_install(
         "system",
         "Installation completed successfully.",
     )?;
-    registry.set_server_runtime(server.id, "offline", None, None)?;
+    set_runtime_state(registry, config, server.id, "offline", None, None).await?;
     server.status = "offline".to_string();
 
     match boot_server(registry, server, config, cancellation).await {
@@ -353,18 +360,27 @@ async fn boot_server(
         };
 
         registry.append_console_message(server.id, "system", &message)?;
-        registry.set_server_runtime(server.id, "offline", None, Some(&message))?;
+        set_runtime_state(registry, config, server.id, "offline", None, Some(&message)).await?;
         bail!(message);
     }
 
     let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    registry.set_server_runtime(server.id, "starting", Some(&container_id), None)?;
-    wait_for_startup(registry, server, &container_id, cancellation).await
+    set_runtime_state(
+        registry,
+        config,
+        server.id,
+        "starting",
+        Some(&container_id),
+        None,
+    )
+    .await?;
+    wait_for_startup(registry, server, config, &container_id, cancellation).await
 }
 
 async fn wait_for_startup(
     registry: &ServerRegistry,
     server: &ManagedServerRecord,
+    config: &DaemonConfig,
     container_id: &str,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -397,7 +413,15 @@ async fn wait_for_startup(
                 "system",
                 "Startup matcher timeout reached after 5 minutes. Marking server running.",
             )?;
-            registry.set_server_runtime(server.id, "running", Some(container_id), None)?;
+            set_runtime_state(
+                registry,
+                config,
+                server.id,
+                "running",
+                Some(container_id),
+                None,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -410,7 +434,7 @@ async fn wait_for_startup(
                         if matches_startup(&line, &matchers) {
                             let _ = child.kill().await;
                             registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
-                            registry.set_server_runtime(server.id, "running", Some(container_id), None)?;
+                            set_runtime_state(registry, config, server.id, "running", Some(container_id), None).await?;
                             return Ok(());
                         }
                     }
@@ -419,7 +443,7 @@ async fn wait_for_startup(
                             let _ = child.wait().await;
                             let message = "Server exited before startup completed.";
                             registry.append_console_message(server.id, "system", message)?;
-                            registry.set_server_runtime(server.id, "offline", None, Some(message))?;
+                            set_runtime_state(registry, config, server.id, "offline", None, Some(message)).await?;
                             bail!(message);
                         }
                     }
@@ -432,7 +456,7 @@ async fn wait_for_startup(
                     if matches_startup(&line, &matchers) {
                         let _ = child.kill().await;
                         registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
-                        registry.set_server_runtime(server.id, "running", Some(container_id), None)?;
+                        set_runtime_state(registry, config, server.id, "running", Some(container_id), None).await?;
                         return Ok(());
                     }
                 }
@@ -668,10 +692,28 @@ fn append_install_log(path: &Path, source: &str, message: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-async fn notify_panel_install_failure(
+async fn set_runtime_state(
+    registry: &ServerRegistry,
     config: &DaemonConfig,
     server_id: u64,
-    error: &str,
+    status: &str,
+    container_id: Option<&str>,
+    last_error: Option<&str>,
+) -> Result<()> {
+    registry.set_server_runtime(server_id, status, container_id, last_error)?;
+
+    if let Err(error) = notify_panel_runtime_update(config, server_id, status, last_error).await {
+        warn!(server_id, status, error = %error, "failed to notify panel about runtime update");
+    }
+
+    Ok(())
+}
+
+async fn notify_panel_runtime_update(
+    config: &DaemonConfig,
+    server_id: u64,
+    status: &str,
+    last_error: Option<&str>,
 ) -> Result<()> {
     let Some(daemon_secret) = config.panel.daemon_secret.as_deref() else {
         return Ok(());
@@ -686,14 +728,14 @@ async fn notify_panel_install_failure(
         .json(&json!({
             "uuid": config.daemon.uuid,
             "version": env!("CARGO_PKG_VERSION"),
-            "status": "install_failed",
-            "last_error": error,
+            "status": status,
+            "last_error": last_error,
         }))
         .send()
         .await
-        .context("failed to notify panel about install failure")?
+        .context("failed to notify panel about runtime update")?
         .error_for_status()
-        .context("panel rejected install failure update")?;
+        .context("panel rejected runtime update")?;
 
     let _ = response;
 
