@@ -59,6 +59,7 @@ impl DaemonApp {
             let service = HeartbeatService::new(
                 self.config.clone(),
                 config_updates.clone(),
+                server_registry.clone(),
                 cancellation.child_token(),
             );
 

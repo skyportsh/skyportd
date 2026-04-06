@@ -23,6 +23,7 @@ pub struct ManagedServerRecord {
     pub volume_path: String,
     pub created_at: String,
     pub updated_at: String,
+    pub allocation: ManagedServerAllocation,
     pub container_id: Option<String>,
     pub last_error: Option<String>,
     pub user: ManagedServerUser,
@@ -42,6 +43,14 @@ pub struct ManagedServerLimits {
     pub memory_mib: u64,
     pub cpu_limit: u64,
     pub disk_mib: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedServerAllocation {
+    pub id: u64,
+    pub bind_ip: String,
+    pub port: u64,
+    pub ip_alias: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +151,7 @@ impl ServerRegistry {
                 file_hidden_list_json TEXT NOT NULL,
                 variables_json TEXT NOT NULL,
                 definition_json TEXT NOT NULL,
+                allocation_json TEXT NOT NULL DEFAULT '{}',
                 container_id TEXT,
                 last_error TEXT
             );
@@ -186,7 +196,7 @@ impl ServerRegistry {
                 startup_command, config_files, config_startup, config_logs, config_stop,
                 install_script, install_container, install_entrypoint,
                 features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-                variables_json, definition_json, container_id, last_error
+                variables_json, definition_json, allocation_json, container_id, last_error
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10,
@@ -195,7 +205,7 @@ impl ServerRegistry {
                 ?18, ?19, ?20, ?21, ?22,
                 ?23, ?24, ?25,
                 ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33
+                ?30, ?31, ?32, ?33, ?34
             )
             ON CONFLICT(id) DO UPDATE SET
                 node_id = excluded.node_id,
@@ -228,6 +238,7 @@ impl ServerRegistry {
                 file_hidden_list_json = excluded.file_hidden_list_json,
                 variables_json = excluded.variables_json,
                 definition_json = excluded.definition_json,
+                allocation_json = excluded.allocation_json,
                 container_id = excluded.container_id,
                 last_error = excluded.last_error
             "#,
@@ -263,6 +274,7 @@ impl ServerRegistry {
                 serde_json::to_string(&server.cargo.file_hidden_list)?,
                 serde_json::to_string(&server.cargo.variables)?,
                 serde_json::to_string(&server.cargo.definition)?,
+                serde_json::to_string(&server.allocation)?,
                 container_id,
                 last_error,
             ],
@@ -393,6 +405,16 @@ impl ServerRegistry {
             connection.execute("ALTER TABLE servers ADD COLUMN last_error TEXT", [])?;
         }
 
+        if !existing_columns
+            .iter()
+            .any(|column| column == "allocation_json")
+        {
+            connection.execute(
+                "ALTER TABLE servers ADD COLUMN allocation_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -446,7 +468,7 @@ SELECT
     startup_command, config_files, config_startup, config_logs, config_stop,
     install_script, install_container, install_entrypoint,
     features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-    variables_json, definition_json, container_id, last_error
+    variables_json, definition_json, allocation_json, container_id, last_error
 FROM servers
 "#;
 
@@ -459,8 +481,9 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
         volume_path: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
-        container_id: row.get(31)?,
-        last_error: row.get(32)?,
+        allocation: parse_json(row.get::<_, String>(31)?)?,
+        container_id: row.get(32)?,
+        last_error: row.get(33)?,
         user: ManagedServerUser {
             id: row.get(7)?,
             name: row.get(8)?,
@@ -569,6 +592,12 @@ mod tests {
                     field_type: "text".to_string(),
                 }],
                 definition: serde_json::json!({"meta":{"version":"SPDL_v1"}}),
+            },
+            allocation: ManagedServerAllocation {
+                id: 77,
+                bind_ip: "0.0.0.0".to_string(),
+                port: 25565,
+                ip_alias: Some("play.example.com".to_string()),
             },
         };
 

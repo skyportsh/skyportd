@@ -107,7 +107,7 @@ async fn should_reconcile(server: &ManagedServerRecord, config: &DaemonConfig) -
     }
 
     match server.status.as_str() {
-        "pending" | "offline" | "starting" | "online" => true,
+        "pending" | "offline" | "starting" | "running" => true,
         "installing" => true,
         "install_failed" => false,
         _ => true,
@@ -128,7 +128,7 @@ async fn reconcile_server(
         "pending" | "installing" => {
             provision_and_install(&registry, &mut server, &config, &cancellation).await?;
         }
-        "offline" | "starting" | "online" => {
+        "offline" | "starting" | "running" => {
             if !runtime_container_is_running(&server).await? {
                 boot_server(&registry, &mut server, &config, &cancellation).await?;
             }
@@ -266,6 +266,11 @@ async fn boot_server(
         .arg(format!("{}:/home/container", volume_path.display()))
         .arg("-w")
         .arg("/home/container")
+        .arg("-p")
+        .arg(format!(
+            "{}:{}:{}",
+            server.allocation.bind_ip, server.allocation.port, server.allocation.port
+        ))
         .arg("--memory")
         .arg(format!("{}m", server.limits.memory_mib));
 
@@ -283,7 +288,10 @@ async fn boot_server(
         .arg(&image)
         .arg("sh")
         .arg("-lc")
-        .arg(&server.cargo.startup_command);
+        .arg(interpolate_runtime_string(
+            &server.cargo.startup_command,
+            server,
+        ));
 
     let output = command
         .output()
@@ -341,9 +349,9 @@ async fn wait_for_startup(
             registry.append_console_message(
                 server.id,
                 "system",
-                "Startup matcher timeout reached after 5 minutes. Marking server online.",
+                "Startup matcher timeout reached after 5 minutes. Marking server running.",
             )?;
-            registry.set_server_runtime(server.id, "online", Some(container_id), None)?;
+            registry.set_server_runtime(server.id, "running", Some(container_id), None)?;
             return Ok(());
         }
 
@@ -355,8 +363,8 @@ async fn wait_for_startup(
 
                         if matches_startup(&line, &matchers) {
                             let _ = child.kill().await;
-                            registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server online.")?;
-                            registry.set_server_runtime(server.id, "online", Some(container_id), None)?;
+                            registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
+                            registry.set_server_runtime(server.id, "running", Some(container_id), None)?;
                             return Ok(());
                         }
                     }
@@ -377,8 +385,8 @@ async fn wait_for_startup(
 
                     if matches_startup(&line, &matchers) {
                         let _ = child.kill().await;
-                        registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server online.")?;
-                        registry.set_server_runtime(server.id, "online", Some(container_id), None)?;
+                        registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
+                        registry.set_server_runtime(server.id, "running", Some(container_id), None)?;
                         return Ok(());
                     }
                 }
@@ -493,6 +501,10 @@ fn apply_properties_replacements(
 }
 
 fn interpolate_config_value(value: &str, server: &ManagedServerRecord) -> String {
+    interpolate_runtime_string(value, server)
+}
+
+fn interpolate_runtime_string(value: &str, server: &ManagedServerRecord) -> String {
     value
         .replace(
             "{{server.memory_limit}}",
@@ -501,6 +513,19 @@ fn interpolate_config_value(value: &str, server: &ManagedServerRecord) -> String
         .replace("{{server.disk_limit}}", &server.limits.disk_mib.to_string())
         .replace("{{server.cpu_limit}}", &server.limits.cpu_limit.to_string())
         .replace("{{server.id}}", &server.id.to_string())
+        .replace(
+            "{{server.build.default.port}}",
+            &server.allocation.port.to_string(),
+        )
+        .replace("{{server.build.default.ip}}", &server.allocation.bind_ip)
+        .replace(
+            "{{server.build.default.host}}",
+            server
+                .allocation
+                .ip_alias
+                .as_deref()
+                .unwrap_or(server.allocation.bind_ip.as_str()),
+        )
 }
 
 fn startup_matchers(config_startup: &str) -> Vec<String> {

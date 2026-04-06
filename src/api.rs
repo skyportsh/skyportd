@@ -24,8 +24,8 @@ use tracing::{info, warn};
 use crate::config::{DaemonConfig, NodeSection, project_root};
 use crate::configuration;
 use crate::server_registry::{
-    ConsoleMessageRecord, ManagedServerCargo, ManagedServerLimits, ManagedServerRecord,
-    ManagedServerUser, ManagedServerVariable, ServerRegistry,
+    ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerLimits,
+    ManagedServerRecord, ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -97,9 +97,18 @@ struct ServerPayload {
     volume_path: String,
     created_at: String,
     updated_at: String,
+    allocation: ServerAllocationPayload,
     user: ServerUserPayload,
     limits: ServerLimitsPayload,
     cargo: ServerCargoPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerAllocationPayload {
+    id: u64,
+    bind_ip: String,
+    port: u64,
+    ip_alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,6 +434,12 @@ async fn sync_server(
         volume_path: payload.server.volume_path,
         created_at: payload.server.created_at,
         updated_at: payload.server.updated_at,
+        allocation: ManagedServerAllocation {
+            id: payload.server.allocation.id,
+            bind_ip: payload.server.allocation.bind_ip,
+            port: payload.server.allocation.port,
+            ip_alias: payload.server.allocation.ip_alias,
+        },
         container_id: None,
         last_error: None,
         user: ManagedServerUser {
