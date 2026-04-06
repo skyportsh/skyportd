@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::api::ApiService;
 use crate::config::DaemonConfig;
+use crate::server_registry::ServerRegistry;
 use crate::service::HeartbeatService;
 use crate::shutdown;
 
@@ -48,6 +49,10 @@ impl DaemonApp {
         let cancellation = CancellationToken::new();
         let tracker = TaskTracker::new();
         let (config_updates, config_rx) = watch::channel(self.config.clone());
+        let server_registry = ServerRegistry::new_default()?;
+        server_registry.initialize()?;
+
+        info!(db_path = %server_registry.db_path().display(), "server registry initialized");
 
         tracker.spawn({
             let service = HeartbeatService::new(
@@ -60,7 +65,12 @@ impl DaemonApp {
         });
 
         tracker.spawn({
-            let service = ApiService::new(config_rx, config_updates, cancellation.child_token());
+            let service = ApiService::new(
+                config_rx,
+                config_updates,
+                server_registry,
+                cancellation.child_token(),
+            );
 
             async move { service.run().await.context("api service stopped") }
         });
