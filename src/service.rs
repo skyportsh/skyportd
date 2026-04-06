@@ -8,19 +8,11 @@ use tracing::{debug, info, warn};
 
 use crate::config::{DaemonConfig, NodeSection};
 use crate::configuration;
-use crate::server_registry::ServerRegistry;
 
 #[derive(Serialize)]
 struct HeartbeatRequest<'a> {
     uuid: &'a str,
     version: &'static str,
-    servers: Vec<HeartbeatServerStatus>,
-}
-
-#[derive(Serialize)]
-struct HeartbeatServerStatus {
-    id: u64,
-    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,7 +23,6 @@ struct HeartbeatResponse {
 pub struct HeartbeatService {
     config: DaemonConfig,
     config_updates: watch::Sender<DaemonConfig>,
-    server_registry: ServerRegistry,
     cancellation: CancellationToken,
 }
 
@@ -39,13 +30,11 @@ impl HeartbeatService {
     pub fn new(
         config: DaemonConfig,
         config_updates: watch::Sender<DaemonConfig>,
-        server_registry: ServerRegistry,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
             config,
             config_updates,
-            server_registry,
             cancellation,
         }
     }
@@ -105,7 +94,6 @@ impl HeartbeatService {
             .json(&HeartbeatRequest {
                 uuid: &self.config.daemon.uuid,
                 version: env!("CARGO_PKG_VERSION"),
-                servers: self.server_statuses()?,
             })
             .send()
             .await?
@@ -117,22 +105,6 @@ impl HeartbeatService {
             .context("failed to parse heartbeat response")?;
 
         Ok(payload.configuration)
-    }
-
-    fn server_statuses(&self) -> Result<Vec<HeartbeatServerStatus>> {
-        let Some(node_id) = self.config.panel.node_id else {
-            return Ok(Vec::new());
-        };
-
-        Ok(self
-            .server_registry
-            .list_servers_for_node(node_id)?
-            .into_iter()
-            .map(|server| HeartbeatServerStatus {
-                id: server.id,
-                status: server.status,
-            })
-            .collect())
     }
 
     fn apply_node_configuration(&mut self, mut configuration: NodeSection) -> Result<()> {
