@@ -320,18 +320,11 @@ async fn boot_server(
             .arg(format!("{:.2}", server.limits.cpu_limit as f64 / 100.0));
     }
 
-    for (key, value) in default_environment(&server.cargo) {
+    for (key, value) in runtime_environment(server) {
         command.arg("-e").arg(format!("{key}={value}"));
     }
 
-    command
-        .arg(&image)
-        .arg("sh")
-        .arg("-lc")
-        .arg(interpolate_runtime_string(
-            &server.cargo.startup_command,
-            server,
-        ));
+    command.arg(&image);
 
     let output = command
         .output()
@@ -615,6 +608,34 @@ fn default_environment(cargo: &ManagedServerCargo) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn runtime_environment(server: &ManagedServerRecord) -> BTreeMap<String, String> {
+    let mut environment = default_environment(&server.cargo);
+
+    environment.insert(
+        "STARTUP".to_string(),
+        interpolate_runtime_string(&server.cargo.startup_command, server),
+    );
+    environment.insert(
+        "SERVER_MEMORY".to_string(),
+        server.limits.memory_mib.to_string(),
+    );
+    environment.insert(
+        "SERVER_CPU".to_string(),
+        server.limits.cpu_limit.to_string(),
+    );
+    environment.insert(
+        "SERVER_DISK".to_string(),
+        server.limits.disk_mib.to_string(),
+    );
+    environment.insert("SERVER_IP".to_string(), server.allocation.bind_ip.clone());
+    environment.insert(
+        "SERVER_PORT".to_string(),
+        server.allocation.port.to_string(),
+    );
+
+    environment
+}
+
 fn normalize_shell_script(script: &str) -> String {
     script.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -857,7 +878,36 @@ mod tests {
 
     #[test]
     fn runtime_interpolation_replaces_cargo_variable_placeholders() {
-        let server = ManagedServerRecord {
+        let server = sample_server();
+
+        assert_eq!(
+            interpolate_runtime_string(&server.cargo.startup_command, &server),
+            "java -jar server.jar",
+        );
+    }
+
+    #[test]
+    fn runtime_environment_includes_pterodactyl_style_values() {
+        let server = sample_server();
+        let environment = runtime_environment(&server);
+
+        assert_eq!(
+            environment.get("SERVER_JARFILE"),
+            Some(&"server.jar".to_string())
+        );
+        assert_eq!(
+            environment.get("STARTUP"),
+            Some(&"java -jar server.jar".to_string())
+        );
+        assert_eq!(environment.get("SERVER_MEMORY"), Some(&"1024".to_string()));
+        assert_eq!(environment.get("SERVER_CPU"), Some(&"100".to_string()));
+        assert_eq!(environment.get("SERVER_DISK"), Some(&"10240".to_string()));
+        assert_eq!(environment.get("SERVER_IP"), Some(&"0.0.0.0".to_string()));
+        assert_eq!(environment.get("SERVER_PORT"), Some(&"25565".to_string()));
+    }
+
+    fn sample_server() -> ManagedServerRecord {
+        ManagedServerRecord {
             id: 1,
             node_id: 1,
             name: "Paper".to_string(),
@@ -912,12 +962,7 @@ mod tests {
                 }],
                 definition: Value::Null,
             },
-        };
-
-        assert_eq!(
-            interpolate_runtime_string(&server.cargo.startup_command, &server),
-            "java -jar server.jar",
-        );
+        }
     }
 
     #[test]
