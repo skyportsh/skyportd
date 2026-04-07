@@ -645,9 +645,9 @@ mod tests {
 
     #[test]
     fn detects_compatibility_messages() {
-        assert!(is_compatibility_error_message(
-            "This version of skyportd isn't compatible with Skyport panel 0.1.0."
-        ));
+        assert!(is_compatibility_error_message(&format!(
+            "This version of skyportd isn't compatible with Skyport panel {CURRENT_VERSION}."
+        )));
         assert!(!is_compatibility_error_message(
             "The enrollment token is invalid."
         ));
