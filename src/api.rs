@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -1029,6 +1029,7 @@ fn server_requires_recreate(existing: &ManagedServerRecord, server: &ManagedServ
 
 async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
     let name = runtime_container_name(server.id);
+    let disk_bytes = current_disk_usage_bytes(server).await.unwrap_or(0);
     let output = docker_command()
         .arg("stats")
         .arg("--no-stream")
@@ -1041,6 +1042,7 @@ async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value
 
     if !output.status.success() {
         return Ok(json!({
+            "disk_bytes": disk_bytes,
             "server": server.id,
             "running": false,
             "state": server.status,
@@ -1050,6 +1052,7 @@ async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
         return Ok(json!({
+            "disk_bytes": disk_bytes,
             "server": server.id,
             "running": false,
             "state": server.status,
@@ -1060,6 +1063,7 @@ async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value
         serde_json::from_str(&stdout).context("failed to parse docker stats payload")?;
 
     Ok(json!({
+        "disk_bytes": disk_bytes,
         "server": server.id,
         "running": true,
         "state": server.status,
@@ -1513,6 +1517,37 @@ fn resolve_volume_path(server: &ManagedServerRecord) -> Result<PathBuf> {
     Ok(project_root()?.join(&server.volume_path))
 }
 
+async fn current_disk_usage_bytes(server: &ManagedServerRecord) -> Result<u64> {
+    let volume_path = resolve_volume_path(server)?;
+
+    tokio::task::spawn_blocking(move || directory_size(&volume_path))
+        .await
+        .context("failed to join disk usage task")?
+}
+
+fn directory_size(path: &StdPath) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let mut total = 0_u64;
+
+    for entry in
+        std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+    {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+
+        if metadata.is_dir() {
+            total += directory_size(&entry.path())?;
+        } else {
+            total += metadata.len();
+        }
+    }
+
+    Ok(total)
+}
+
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ApiErrorResponse>) {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
@@ -1614,6 +1649,14 @@ mod tests {
         assert!(
             script.contains("printf '%s\\n' \"$SKYPORT_SERVER_COMMAND\" > \"/proc/$pid/fd/0\"")
         );
+    }
+
+    #[test]
+    fn directory_size_returns_zero_for_missing_paths() {
+        let missing =
+            std::env::temp_dir().join(format!("skyportd-api-missing-{}", current_unix_timestamp()));
+
+        assert_eq!(directory_size(&missing).expect("directory size"), 0);
     }
 
     #[test]
