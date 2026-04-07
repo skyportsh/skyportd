@@ -386,6 +386,43 @@ impl ServerRegistry {
         Ok(messages)
     }
 
+    pub fn recent_console_messages(
+        &self,
+        server_id: u64,
+        limit: u64,
+    ) -> Result<Vec<ConsoleMessageRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, server_id, source, message, created_at
+            FROM (
+                SELECT id, server_id, source, message, created_at
+                FROM server_console_messages
+                WHERE server_id = ?1
+                ORDER BY id DESC
+                LIMIT ?2
+            )
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![server_id, limit], |row| {
+            Ok(ConsoleMessageRecord {
+                id: row.get(0)?,
+                server_id: row.get(1)?,
+                source: row.get(2)?,
+                message: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut messages = Vec::new();
+
+        for row in rows {
+            messages.push(row?);
+        }
+
+        Ok(messages)
+    }
+
     fn open(&self) -> Result<Connection> {
         Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))
@@ -608,6 +645,28 @@ mod tests {
         registry
             .append_console_message(server.id, "system", "Preparing volume")
             .unwrap();
+
+        let recent_messages = (1..=60)
+            .map(|index| format!("Message {index}"))
+            .collect::<Vec<_>>();
+
+        for message in &recent_messages {
+            registry
+                .append_console_message(server.id, "stdout", message)
+                .unwrap();
+        }
+
+        let recent = registry.recent_console_messages(server.id, 50).unwrap();
+
+        assert_eq!(recent.len(), 50);
+        assert_eq!(
+            recent.first().map(|message| message.message.as_str()),
+            Some("Message 11")
+        );
+        assert_eq!(
+            recent.last().map(|message| message.message.as_str()),
+            Some("Message 60")
+        );
 
         let stored = registry.get_server(server.id).unwrap().unwrap();
         assert_eq!(stored.status, "installing");

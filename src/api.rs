@@ -645,7 +645,7 @@ async fn handle_server_ws(
     let mut last_id = 0_u64;
     let mut last_status: Option<String> = None;
 
-    let mut console_interval = time::interval(Duration::from_millis(500));
+    let mut console_interval = time::interval(Duration::from_millis(100));
     console_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut stats_interval = time::interval(Duration::from_secs(2));
@@ -843,7 +843,7 @@ async fn handle_ws_client_event(
 
     match event.event.as_str() {
         "send logs" => {
-            let backlog = registry.console_messages_since(server_id, 0, 200)?;
+            let backlog = registry.recent_console_messages(server_id, 50)?;
 
             for message in backlog {
                 *last_id = (*last_id).max(message.id);
@@ -857,15 +857,6 @@ async fn handle_ws_client_event(
         "set state" => {
             let signal = parse_power_signal(event.args.first())?;
             apply_power_signal(registry, &server, signal).await?;
-            send_ws_event(
-                socket,
-                "daemon message",
-                vec![Value::String(format!(
-                    "Accepted power action: {}.",
-                    power_signal_name(signal)
-                ))],
-            )
-            .await?;
         }
         "send command" => {
             let command = event
@@ -876,14 +867,6 @@ async fn handle_ws_client_event(
                 .context("The send command event requires a command string.")?;
 
             send_command_to_server(registry, &server, command).await?;
-            send_ws_event(
-                socket,
-                "daemon message",
-                vec![Value::String(
-                    "Command forwarded to the server process.".to_string(),
-                )],
-            )
-            .await?;
         }
         _ => {
             bail!("Unsupported websocket event: {}", event.event);
@@ -964,16 +947,6 @@ fn parse_power_signal(signal: Option<&String>) -> Result<PowerSignal> {
         Some("reinstall") => Ok(PowerSignal::Reinstall),
         Some(value) => bail!("Unsupported power state: {value}"),
         None => bail!("The set state event requires a power state."),
-    }
-}
-
-fn power_signal_name(signal: PowerSignal) -> &'static str {
-    match signal {
-        PowerSignal::Start => "start",
-        PowerSignal::Stop => "stop",
-        PowerSignal::Restart => "restart",
-        PowerSignal::Kill => "kill",
-        PowerSignal::Reinstall => "reinstall",
     }
 }
 
@@ -1205,7 +1178,7 @@ async fn apply_power_signal(
 }
 
 async fn send_command_to_server(
-    registry: &ServerRegistry,
+    _registry: &ServerRegistry,
     server: &ManagedServerRecord,
     command: &str,
 ) -> Result<()> {
@@ -1220,7 +1193,7 @@ async fn send_command_to_server(
         .arg(runtime_container_name(server.id))
         .arg("sh")
         .arg("-lc")
-        .arg("printf '%s\\n' \"$SKYPORT_SERVER_COMMAND\" > /proc/1/fd/0")
+        .arg(runtime_command_forward_script())
         .output()
         .await
         .context("failed to forward command to the runtime container")?;
@@ -1235,13 +1208,26 @@ async fn send_command_to_server(
         bail!("Failed to send the command to the server process: {stderr}");
     }
 
-    registry.append_console_message(
-        server.id,
-        "system",
-        &format!("Console command sent: {command}"),
-    )?;
-
     Ok(())
+}
+
+fn runtime_command_forward_script() -> &'static str {
+    r#"pid=1
+while :; do
+    child=""
+    for stat in /proc/[0-9]*/stat; do
+        set -- $(cat "$stat" 2>/dev/null) || continue
+        if [ "$4" = "$pid" ]; then
+            child="$1"
+            break
+        fi
+    done
+
+    [ -n "$child" ] || break
+    pid="$child"
+done
+
+printf '%s\n' "$SKYPORT_SERVER_COMMAND" > "/proc/$pid/fd/0""#
 }
 
 async fn graceful_stop(
@@ -1617,6 +1603,17 @@ mod tests {
 
         assert_eq!(event.event, "set state");
         assert_eq!(event.args, vec!["restart"]);
+    }
+
+    #[test]
+    fn command_forward_script_targets_the_leaf_process_stdin() {
+        let script = runtime_command_forward_script();
+
+        assert!(script.contains("pid=1"));
+        assert!(script.contains("for stat in /proc/[0-9]*/stat"));
+        assert!(
+            script.contains("printf '%s\\n' \"$SKYPORT_SERVER_COMMAND\" > \"/proc/$pid/fd/0\"")
+        );
     }
 
     #[test]

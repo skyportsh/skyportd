@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
@@ -337,36 +337,7 @@ async fn boot_server(
     registry.append_console_message(server.id, "system", "Starting server container...")?;
 
     let mut command = docker_command();
-    command
-        .arg("run")
-        .arg("-d")
-        .arg("--name")
-        .arg(runtime_container_name(server.id))
-        .arg("--label")
-        .arg(format!("skyport.server_id={}", server.id))
-        .arg("-v")
-        .arg(format!("{}:/home/container", volume_path.display()))
-        .arg("-w")
-        .arg("/home/container")
-        .arg("-p")
-        .arg(format!(
-            "{}:{}:{}",
-            server.allocation.bind_ip, server.allocation.port, server.allocation.port
-        ))
-        .arg("--memory")
-        .arg(format!("{}m", server.limits.memory_mib));
-
-    if server.limits.cpu_limit > 0 {
-        command
-            .arg("--cpus")
-            .arg(format!("{:.2}", server.limits.cpu_limit as f64 / 100.0));
-    }
-
-    for (key, value) in runtime_environment(server) {
-        command.arg("-e").arg(format!("{key}={value}"));
-    }
-
-    command.arg(&image);
+    command.args(runtime_container_run_args(server, &volume_path, &image));
 
     let output = command
         .output()
@@ -421,6 +392,8 @@ async fn wait_for_startup(
     let stderr = child.stderr.take().context("missing runtime stderr")?;
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
 
     loop {
         if cancellation.is_cancelled() {
@@ -444,11 +417,16 @@ async fn wait_for_startup(
                 None,
             )
             .await?;
+            spawn_runtime_log_follower(
+                registry.clone(),
+                server.clone(),
+                cancellation.child_token(),
+            );
             return Ok(());
         }
 
         select! {
-            line = stdout_lines.next_line() => {
+            line = stdout_lines.next_line(), if stdout_open => {
                 match line.context("failed to read runtime stdout")? {
                     Some(line) => {
                         registry.append_console_message(server.id, "stdout", &line)?;
@@ -457,10 +435,17 @@ async fn wait_for_startup(
                             let _ = child.kill().await;
                             registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
                             set_runtime_state(registry, config, server.id, "running", Some(container_id), None).await?;
+                            spawn_runtime_log_follower(
+                                registry.clone(),
+                                server.clone(),
+                                cancellation.child_token(),
+                            );
                             return Ok(());
                         }
                     }
                     None => {
+                        stdout_open = false;
+
                         if !runtime_container_is_running(server).await? {
                             let _ = child.wait().await;
                             let message = "Server exited before startup completed.";
@@ -471,19 +456,136 @@ async fn wait_for_startup(
                     }
                 }
             }
-            line = stderr_lines.next_line() => {
-                if let Some(line) = line.context("failed to read runtime stderr")? {
-                    registry.append_console_message(server.id, "stderr", &line)?;
+            line = stderr_lines.next_line(), if stderr_open => {
+                match line.context("failed to read runtime stderr")? {
+                    Some(line) => {
+                        registry.append_console_message(server.id, "stderr", &line)?;
 
-                    if matches_startup(&line, &matchers) {
-                        let _ = child.kill().await;
-                        registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
-                        set_runtime_state(registry, config, server.id, "running", Some(container_id), None).await?;
-                        return Ok(());
+                        if matches_startup(&line, &matchers) {
+                            let _ = child.kill().await;
+                            registry.append_console_message(server.id, "system", "Startup matcher detected. Marking server running.")?;
+                            set_runtime_state(registry, config, server.id, "running", Some(container_id), None).await?;
+                            spawn_runtime_log_follower(
+                                registry.clone(),
+                                server.clone(),
+                                cancellation.child_token(),
+                            );
+                            return Ok(());
+                        }
+                    }
+                    None => {
+                        stderr_open = false;
                     }
                 }
             }
             _ = time::sleep(Duration::from_millis(250)) => {}
+        }
+
+        if !stdout_open && !stderr_open {
+            if !runtime_container_is_running(server).await? {
+                let _ = child.wait().await;
+                let message = "Server exited before startup completed.";
+                registry.append_console_message(server.id, "system", message)?;
+                set_runtime_state(registry, config, server.id, "offline", None, Some(message))
+                    .await?;
+                bail!(message);
+            }
+
+            bail!("Runtime log streams ended before startup completed.");
+        }
+    }
+}
+
+fn spawn_runtime_log_follower(
+    registry: ServerRegistry,
+    server: ManagedServerRecord,
+    cancellation: CancellationToken,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = follow_runtime_logs(registry, server, cancellation).await {
+            warn!(error = %error, "runtime log follower stopped unexpectedly");
+        }
+    });
+}
+
+async fn follow_runtime_logs(
+    registry: ServerRegistry,
+    server: ManagedServerRecord,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+
+    let mut command = docker_command();
+    command
+        .arg("logs")
+        .arg("--follow")
+        .arg("--since")
+        .arg(since)
+        .arg(runtime_container_name(server.id))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .context("failed to follow runtime logs after startup")?;
+    let stdout = child.stdout.take().context("missing runtime log stdout")?;
+    let stderr = child.stderr.take().context("missing runtime log stderr")?;
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+
+    loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill().await;
+            return Ok(());
+        }
+
+        select! {
+            line = stdout_lines.next_line(), if stdout_open => {
+                match line.context("failed to read runtime stdout after startup")? {
+                    Some(line) => {
+                        registry.append_console_message(server.id, "stdout", &line)?;
+                    }
+                    None => {
+                        stdout_open = false;
+
+                        if !runtime_container_is_running(&server).await? {
+                            let _ = child.wait().await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            line = stderr_lines.next_line(), if stderr_open => {
+                match line.context("failed to read runtime stderr after startup")? {
+                    Some(line) => {
+                        registry.append_console_message(server.id, "stderr", &line)?;
+                    }
+                    None => {
+                        stderr_open = false;
+
+                        if !runtime_container_is_running(&server).await? {
+                            let _ = child.wait().await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            _ = time::sleep(Duration::from_millis(250)) => {}
+        }
+
+        if !stdout_open && !stderr_open {
+            if !runtime_container_is_running(&server).await? {
+                let _ = child.wait().await;
+                return Ok(());
+            }
+
+            bail!("Runtime log follower lost both streams while the container is still running.");
         }
     }
 }
@@ -712,6 +814,47 @@ fn runtime_environment(server: &ManagedServerRecord) -> BTreeMap<String, String>
     );
 
     environment
+}
+
+fn runtime_container_run_args(
+    server: &ManagedServerRecord,
+    volume_path: &Path,
+    image: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "-i".to_string(),
+        "--name".to_string(),
+        runtime_container_name(server.id),
+        "--label".to_string(),
+        format!("skyport.server_id={}", server.id),
+        "-v".to_string(),
+        format!("{}:/home/container", volume_path.display()),
+        "-w".to_string(),
+        "/home/container".to_string(),
+        "-p".to_string(),
+        format!(
+            "{}:{}:{}",
+            server.allocation.bind_ip, server.allocation.port, server.allocation.port
+        ),
+        "--memory".to_string(),
+        format!("{}m", server.limits.memory_mib),
+    ];
+
+    if server.limits.cpu_limit > 0 {
+        args.push("--cpus".to_string());
+        args.push(format!("{:.2}", server.limits.cpu_limit as f64 / 100.0));
+    }
+
+    for (key, value) in runtime_environment(server) {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    args.push(image.to_string());
+
+    args
 }
 
 fn normalize_shell_script(script: &str) -> String {
@@ -1047,6 +1190,23 @@ mod tests {
         assert_eq!(environment.get("SERVER_DISK"), Some(&"10240".to_string()));
         assert_eq!(environment.get("SERVER_IP"), Some(&"0.0.0.0".to_string()));
         assert_eq!(environment.get("SERVER_PORT"), Some(&"25565".to_string()));
+    }
+
+    #[test]
+    fn runtime_container_args_keep_stdin_open_for_console_commands() {
+        let server = sample_server();
+        let args = runtime_container_run_args(
+            &server,
+            Path::new("/tmp/server"),
+            "ghcr.io/example/runtime:latest",
+        );
+
+        assert!(args.iter().any(|arg| arg == "-i"));
+        assert_eq!(args.first(), Some(&"run".to_string()));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "ghcr.io/example/runtime:latest")
+        );
     }
 
     fn sample_server() -> ManagedServerRecord {
