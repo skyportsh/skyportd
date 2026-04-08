@@ -334,7 +334,11 @@ async fn boot_server(
     apply_config_file_actions(registry, server, &volume_path).await?;
     remove_container(&runtime_container_name(server.id)).await?;
 
-    registry.append_console_message(server.id, "system", "Starting server container...")?;
+    registry.append_console_message(
+        server.id,
+        "system",
+        "All systems ready! Starting server...",
+    )?;
 
     let mut command = docker_command();
     command.args(runtime_container_run_args(server, &volume_path, &image));
@@ -627,11 +631,6 @@ async fn apply_config_file_actions(
                 }
 
                 apply_properties_replacements(&file_path, &replacements)?;
-                registry.append_console_message(
-                    server.id,
-                    "system",
-                    &format!("Applied config file actions to {}.", relative_path),
-                )?;
             }
             _ => {
                 registry.append_console_message(
@@ -1155,6 +1154,20 @@ mod tests {
         server.docker_image = Some("java-17".to_string());
 
         assert_eq!(select_runtime_image(&server).unwrap(), "java-17");
+    }
+
+    #[test]
+    fn daemon_console_text_uses_updated_boot_messages() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/server_lifecycle.rs"
+        ));
+        let removed_start_message = ["Starting server", " container..."].concat();
+        let removed_config_action_message = ["Applied config file actions", " to"].concat();
+
+        assert!(source.contains("All systems ready! Starting server..."));
+        assert!(!source.contains(&removed_start_message));
+        assert!(!source.contains(&removed_config_action_message));
     }
 
     #[test]

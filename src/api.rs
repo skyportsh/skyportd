@@ -1094,11 +1094,6 @@ async fn apply_power_signal(
                 )?;
             } else {
                 registry.set_server_runtime(server.id, "starting", None, None)?;
-                registry.append_console_message(
-                    server.id,
-                    "system",
-                    "Start requested. The server will be booted by the lifecycle worker.",
-                )?;
             }
         }
         PowerSignal::Stop => {
@@ -1256,8 +1251,6 @@ async fn graceful_stop(
         )?;
         return Ok(());
     }
-
-    registry.append_console_message(server.id, "system", "Sending graceful stop command...")?;
 
     let stop_command = server.cargo.config_stop.trim();
     let mut graceful_command_sent = false;
@@ -1756,6 +1749,20 @@ mod tests {
             &existing,
             &sample_managed_server()
         ));
+    }
+
+    #[test]
+    fn daemon_console_text_omits_start_and_graceful_stop_noise() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api.rs"));
+        let removed_start_message = [
+            "Start requested.",
+            " The server will be booted by the lifecycle worker.",
+        ]
+        .concat();
+        let removed_stop_message = ["Sending graceful stop", " command..."].concat();
+
+        assert!(!source.contains(&removed_start_message));
+        assert!(!source.contains(&removed_stop_message));
     }
 
     fn current_unix_timestamp() -> u64 {
