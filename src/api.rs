@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as StdPath, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +24,7 @@ use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path};
+use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, safe_join_relative};
 use crate::configuration;
 use crate::server_registry::{
     ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerLimits,
@@ -76,6 +78,68 @@ struct ServerPowerRequest {
 struct WsAuthorizationQuery {
     uuid: String,
     panel_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerFilesystemQuery {
+    uuid: String,
+    panel_version: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerFileContentsRequest {
+    uuid: String,
+    panel_version: String,
+    path: String,
+    contents: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerCreateFilesystemEntryRequest {
+    uuid: String,
+    panel_version: String,
+    path: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerDeleteFilesRequest {
+    uuid: String,
+    panel_version: String,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesystemEntryPayload {
+    kind: String,
+    last_modified_at: Option<u64>,
+    name: String,
+    path: String,
+    permissions: Option<String>,
+    size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryListingPayload {
+    entries: Vec<FilesystemEntryPayload>,
+    parent_path: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FileContentsPayload {
+    contents: String,
+    last_modified_at: Option<u64>,
+    path: String,
+    permissions: Option<String>,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerFilesystemMutationResponse {
+    message: String,
+    ok: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +353,20 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
         .route("/api/daemon/configuration/sync", post(sync_configuration))
         .route("/api/daemon/servers/sync", post(sync_server))
         .route("/api/daemon/servers/{server_id}", delete(delete_server))
+        .route(
+            "/api/daemon/servers/{server_id}/files",
+            get(list_server_files)
+                .post(create_server_file)
+                .delete(delete_server_files),
+        )
+        .route(
+            "/api/daemon/servers/{server_id}/files/contents",
+            get(read_server_file).put(write_server_file),
+        )
+        .route(
+            "/api/daemon/servers/{server_id}/files/directories",
+            post(create_server_directory),
+        )
         .route("/api/daemon/servers/{server_id}/power", post(power_server))
         .route(
             "/api/daemon/servers/{server_id}/install-log",
@@ -552,6 +630,151 @@ async fn delete_server(
     }
 
     Ok(Json(ApiSuccessResponse { ok: true }))
+}
+
+async fn list_server_files(
+    Path(server_id): Path<u64>,
+    Query(query): Query<ServerFilesystemQuery>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<DirectoryListingPayload>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+    let requested_path = query.path.unwrap_or_default();
+
+    let listing = tokio::task::spawn_blocking(move || list_directory(&server, &requested_path))
+        .await
+        .context("failed to join files listing task")
+        .map_err(internal_error)?
+        .map_err(filesystem_error)?;
+
+    Ok(Json(listing))
+}
+
+async fn read_server_file(
+    Path(server_id): Path<u64>,
+    Query(query): Query<ServerFilesystemQuery>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<FileContentsPayload>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+    let requested_path = query.path.unwrap_or_default();
+
+    let file = tokio::task::spawn_blocking(move || read_text_file(&server, &requested_path))
+        .await
+        .context("failed to join file read task")
+        .map_err(internal_error)?
+        .map_err(filesystem_error)?;
+
+    Ok(Json(file))
+}
+
+async fn write_server_file(
+    Path(server_id): Path<u64>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServerFileContentsRequest>,
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+
+    tokio::task::spawn_blocking(move || write_text_file(&server, &payload.path, &payload.contents))
+        .await
+        .context("failed to join file write task")
+        .map_err(internal_error)?
+        .map_err(filesystem_error)?;
+
+    Ok(Json(ServerFilesystemMutationResponse {
+        message: "File saved successfully.".to_string(),
+        ok: true,
+    }))
+}
+
+async fn create_server_file(
+    Path(server_id): Path<u64>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServerCreateFilesystemEntryRequest>,
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+
+    tokio::task::spawn_blocking(move || create_file(&server, &payload.path, &payload.name))
+        .await
+        .context("failed to join file creation task")
+        .map_err(internal_error)?
+        .map_err(filesystem_error)?;
+
+    Ok(Json(ServerFilesystemMutationResponse {
+        message: "File created successfully.".to_string(),
+        ok: true,
+    }))
+}
+
+async fn create_server_directory(
+    Path(server_id): Path<u64>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServerCreateFilesystemEntryRequest>,
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+
+    tokio::task::spawn_blocking(move || create_directory(&server, &payload.path, &payload.name))
+        .await
+        .context("failed to join directory creation task")
+        .map_err(internal_error)?
+        .map_err(filesystem_error)?;
+
+    Ok(Json(ServerFilesystemMutationResponse {
+        message: "Directory created successfully.".to_string(),
+        ok: true,
+    }))
+}
+
+async fn delete_server_files(
+    Path(server_id): Path<u64>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServerDeleteFilesRequest>,
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    let server = load_managed_server(&state.server_registry, &config, server_id)?;
+    let deleted_count = payload.paths.len();
+
+    tokio::task::spawn_blocking(move || delete_files(&server, &payload.paths))
+        .await
+        .context("failed to join file deletion task")
+        .map_err(internal_error)?
+        .map_err(filesystem_error)?;
+
+    Ok(Json(ServerFilesystemMutationResponse {
+        message: if deleted_count == 1 {
+            "Deleted 1 item.".to_string()
+        } else {
+            format!("Deleted {deleted_count} items.")
+        },
+        ok: true,
+    }))
 }
 
 async fn power_server(
@@ -1549,8 +1772,321 @@ fn directory_size(path: &StdPath) -> Result<u64> {
     Ok(total)
 }
 
+fn list_directory(server: &ManagedServerRecord, requested_path: &str) -> Result<DirectoryListingPayload> {
+    let volume_path = ensure_server_volume(server)?;
+    let normalized_path = normalize_relative_path(requested_path)?;
+    let directory_path = resolve_existing_server_path(&volume_path, &normalized_path)?;
+    let metadata = fs::metadata(&directory_path)
+        .with_context(|| format!("failed to read metadata for {}", directory_path.display()))?;
+
+    if !metadata.is_dir() {
+        bail!("The requested path is not a directory.");
+    }
+
+    let mut entries = fs::read_dir(&directory_path)
+        .with_context(|| format!("failed to read {}", directory_path.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| filesystem_entry_payload(&volume_path, entry.path()).transpose())
+        .collect::<Result<Vec<_>>>()?;
+
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+
+    Ok(DirectoryListingPayload {
+        entries,
+        parent_path: parent_relative_path(&normalized_path),
+        path: normalized_path,
+    })
+}
+
+fn read_text_file(server: &ManagedServerRecord, requested_path: &str) -> Result<FileContentsPayload> {
+    let volume_path = ensure_server_volume(server)?;
+    let normalized_path = normalize_relative_path(requested_path)?;
+
+    if normalized_path.is_empty() {
+        bail!("The requested path is not a file.");
+    }
+
+    let file_path = resolve_existing_server_path(&volume_path, &normalized_path)?;
+    let metadata = fs::metadata(&file_path)
+        .with_context(|| format!("failed to read metadata for {}", file_path.display()))?;
+
+    if !metadata.is_file() {
+        bail!("The requested path is not a file.");
+    }
+
+    if metadata.len() > 1024 * 1024 {
+        bail!("This file is too large to open in the editor.");
+    }
+
+    let bytes = fs::read(&file_path)
+        .with_context(|| format!("failed to read {}", file_path.display()))?;
+
+    if bytes.contains(&0) {
+        bail!("This file could not be opened as text.");
+    }
+
+    let contents = String::from_utf8(bytes).context("This file could not be opened as text.")?;
+
+    Ok(FileContentsPayload {
+        contents,
+        last_modified_at: modified_at(&metadata),
+        path: normalized_path,
+        permissions: Some(format_permissions(metadata.permissions().mode())),
+        size_bytes: metadata.len(),
+    })
+}
+
+fn write_text_file(server: &ManagedServerRecord, requested_path: &str, contents: &str) -> Result<()> {
+    if contents.len() > 2 * 1024 * 1024 {
+        bail!("This file is too large to save through the editor.");
+    }
+
+    let volume_path = ensure_server_volume(server)?;
+    let normalized_path = normalize_relative_path(requested_path)?;
+
+    if normalized_path.is_empty() {
+        bail!("The requested path is not a file.");
+    }
+
+    let file_path = resolve_server_path_for_write(&volume_path, &normalized_path)?;
+
+    if file_path.is_dir() {
+        bail!("The requested path is not a file.");
+    }
+
+    fs::write(&file_path, contents)
+        .with_context(|| format!("failed to write {}", file_path.display()))?;
+
+    Ok(())
+}
+
+fn create_file(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
+    let volume_path = ensure_server_volume(server)?;
+    let directory_path = resolve_existing_server_path(
+        &volume_path,
+        &normalize_relative_path(requested_path)?,
+    )?;
+
+    if !fs::metadata(&directory_path)?.is_dir() {
+        bail!("The requested path is not a directory.");
+    }
+
+    let file_path = directory_path.join(validate_entry_name(name)?);
+
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&file_path)
+        .with_context(|| format!("failed to create {}", file_path.display()))?;
+
+    Ok(())
+}
+
+fn create_directory(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
+    let volume_path = ensure_server_volume(server)?;
+    let directory_path = resolve_existing_server_path(
+        &volume_path,
+        &normalize_relative_path(requested_path)?,
+    )?;
+
+    if !fs::metadata(&directory_path)?.is_dir() {
+        bail!("The requested path is not a directory.");
+    }
+
+    let next_directory = directory_path.join(validate_entry_name(name)?);
+
+    fs::create_dir(&next_directory)
+        .with_context(|| format!("failed to create {}", next_directory.display()))?;
+
+    Ok(())
+}
+
+fn delete_files(server: &ManagedServerRecord, paths: &[String]) -> Result<()> {
+    let volume_path = ensure_server_volume(server)?;
+
+    if paths.is_empty() {
+        bail!("Please select at least one file or directory.");
+    }
+
+    for path in paths {
+        let normalized_path = normalize_relative_path(path)?;
+
+        if normalized_path.is_empty() {
+            bail!("The server root cannot be deleted.");
+        }
+
+        let target_path = resolve_existing_server_path(&volume_path, &normalized_path)?;
+        let metadata = fs::metadata(&target_path)
+            .with_context(|| format!("failed to read metadata for {}", target_path.display()))?;
+
+        if metadata.is_dir() {
+            fs::remove_dir_all(&target_path)
+                .with_context(|| format!("failed to delete {}", target_path.display()))?;
+        } else {
+            fs::remove_file(&target_path)
+                .with_context(|| format!("failed to delete {}", target_path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn filesystem_entry_payload(volume_path: &PathBuf, entry_path: PathBuf) -> Result<Option<FilesystemEntryPayload>> {
+    let symlink_metadata = fs::symlink_metadata(&entry_path)
+        .with_context(|| format!("failed to read metadata for {}", entry_path.display()))?;
+
+    if symlink_metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+
+    let metadata = fs::metadata(&entry_path)
+        .with_context(|| format!("failed to read metadata for {}", entry_path.display()))?;
+    let relative_path = entry_path
+        .strip_prefix(volume_path)
+        .context("failed to determine relative path")?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let name = entry_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("failed to determine file name")?
+        .to_string();
+
+    Ok(Some(FilesystemEntryPayload {
+        kind: if metadata.is_dir() {
+            "directory".to_string()
+        } else {
+            "file".to_string()
+        },
+        last_modified_at: modified_at(&metadata),
+        name,
+        path: relative_path,
+        permissions: Some(format_permissions(metadata.permissions().mode())),
+        size_bytes: if metadata.is_file() { Some(metadata.len()) } else { None },
+    }))
+}
+
+fn ensure_server_volume(server: &ManagedServerRecord) -> Result<PathBuf> {
+    let volume_path = resolve_volume_path(server)?;
+    fs::create_dir_all(&volume_path)
+        .with_context(|| format!("failed to create {}", volume_path.display()))?;
+    fs::canonicalize(&volume_path)
+        .with_context(|| format!("failed to resolve {}", volume_path.display()))
+}
+
+fn normalize_relative_path(path: &str) -> Result<String> {
+    if path.trim().is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut segments = Vec::new();
+
+    for component in StdPath::new(path).components() {
+        match component {
+            std::path::Component::Normal(segment) => segments.push(segment.to_string_lossy().to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!("path must stay within the server volume");
+            }
+        }
+    }
+
+    Ok(segments.join("/"))
+}
+
+fn resolve_existing_server_path(volume_path: &PathBuf, relative_path: &str) -> Result<PathBuf> {
+    if relative_path.is_empty() {
+        return Ok(volume_path.clone());
+    }
+
+    let candidate = safe_join_relative(volume_path, relative_path)?;
+    let resolved = fs::canonicalize(&candidate)
+        .with_context(|| format!("failed to resolve {}", candidate.display()))?;
+
+    if !resolved.starts_with(volume_path) {
+        bail!("path must stay within the server volume");
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_server_path_for_write(volume_path: &PathBuf, relative_path: &str) -> Result<PathBuf> {
+    let candidate = safe_join_relative(volume_path, relative_path)?;
+
+    if candidate.exists() {
+        let resolved = fs::canonicalize(&candidate)
+            .with_context(|| format!("failed to resolve {}", candidate.display()))?;
+
+        if !resolved.starts_with(volume_path) {
+            bail!("path must stay within the server volume");
+        }
+
+        return Ok(resolved);
+    }
+
+    let parent = candidate.parent().context("path must stay within the server volume")?;
+    let resolved_parent = fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve {}", parent.display()))?;
+
+    if !resolved_parent.starts_with(volume_path) {
+        bail!("path must stay within the server volume");
+    }
+
+    let name = candidate.file_name().context("path must stay within the server volume")?;
+
+    Ok(resolved_parent.join(name))
+}
+
+fn validate_entry_name(name: &str) -> Result<&str> {
+    let trimmed = name.trim();
+
+    if trimmed.is_empty() {
+        bail!("name cannot be empty");
+    }
+
+    let path = StdPath::new(trimmed);
+    let mut components = path.components();
+
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(trimmed),
+        _ => bail!("name must be a single path segment"),
+    }
+}
+
+fn parent_relative_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+
+    let mut segments = path.split('/').collect::<Vec<_>>();
+    segments.pop();
+
+    Some(segments.join("/"))
+}
+
+fn modified_at(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn format_permissions(mode: u32) -> String {
+    format!("{:03o}", mode & 0o777)
+}
+
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ApiErrorResponse>) {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn filesystem_error(error: anyhow::Error) -> (StatusCode, Json<ApiErrorResponse>) {
+    error_response(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
 }
 
 fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ApiErrorResponse>) {
@@ -1559,7 +2095,10 @@ fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ApiE
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use serde_json::json;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -1763,6 +2302,38 @@ mod tests {
 
         assert!(!source.contains(&removed_start_message));
         assert!(!source.contains(&removed_stop_message));
+    }
+
+    #[test]
+    fn existing_filesystem_paths_reject_symlink_escapes() {
+        let tempdir = tempdir().unwrap();
+        let volume = tempdir.path().join("volume");
+        let outside = tempdir.path().join("outside");
+        std::fs::create_dir_all(&volume).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, volume.join("escape")).unwrap();
+
+        let error = resolve_existing_server_path(&volume, "escape")
+            .expect_err("symlink escape should be rejected")
+            .to_string();
+
+        assert!(error.contains("within the server volume"));
+    }
+
+    #[test]
+    fn write_paths_reject_symlink_escapes() {
+        let tempdir = tempdir().unwrap();
+        let volume = tempdir.path().join("volume");
+        let outside = tempdir.path().join("outside.txt");
+        std::fs::create_dir_all(&volume).unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        symlink(&outside, volume.join("escape.txt")).unwrap();
+
+        let error = resolve_server_path_for_write(&volume, "escape.txt")
+            .expect_err("symlink escape should be rejected")
+            .to_string();
+
+        assert!(error.contains("within the server volume"));
     }
 
     fn current_unix_timestamp() -> u64 {
