@@ -1,8 +1,8 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use config::{Config, Environment, File};
 use serde::Deserialize;
 
@@ -319,6 +319,34 @@ pub fn project_root() -> Result<PathBuf> {
     Ok(normalize_root(&current_dir))
 }
 
+pub fn managed_server_volume_path(server_id: u64) -> Result<PathBuf> {
+    Ok(project_root()?.join("volumes").join(server_id.to_string()))
+}
+
+pub fn safe_join_relative(base: &Path, relative: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+
+    if relative.trim().is_empty() {
+        bail!("path cannot be empty");
+    }
+
+    let mut resolved = base.to_path_buf();
+
+    for component in relative_path.components() {
+        match component {
+            Component::Normal(segment) => {
+                resolved.push(segment);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("path must stay within the server volume");
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
 fn normalize_root(path: &Path) -> PathBuf {
     if path.ends_with("src") {
         path.parent().unwrap_or(path).to_path_buf()
@@ -330,6 +358,30 @@ fn normalize_root(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_join_relative_rejects_path_traversal_and_absolute_paths() {
+        let base = Path::new("/tmp/skyportd-test");
+
+        let traversal = safe_join_relative(base, "../../etc/passwd")
+            .expect_err("path traversal should be rejected")
+            .to_string();
+        let absolute = safe_join_relative(base, "/etc/passwd")
+            .expect_err("absolute paths should be rejected")
+            .to_string();
+
+        assert!(traversal.contains("within the server volume"));
+        assert!(absolute.contains("within the server volume"));
+    }
+
+    #[test]
+    fn safe_join_relative_allows_nested_relative_paths() {
+        let base = Path::new("/tmp/skyportd-test");
+        let path = safe_join_relative(base, "configs/server.properties")
+            .expect("nested relative path should resolve");
+
+        assert_eq!(path, base.join("configs/server.properties"));
+    }
 
     #[test]
     fn parses_default_config() {

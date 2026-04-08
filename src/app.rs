@@ -163,6 +163,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn startup_banner_text() -> String {
     format!(
         "{ascii}\nskyportd {version}\nCopyright © 2026 Skyport",
