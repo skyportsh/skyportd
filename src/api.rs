@@ -1428,6 +1428,14 @@ fn authenticate_ws_event(
     Ok(())
 }
 
+fn runtime_status_after_start_request(is_running: bool) -> &'static str {
+    if is_running {
+        "running"
+    } else {
+        "starting"
+    }
+}
+
 fn parse_power_signal(signal: Option<&String>) -> Result<PowerSignal> {
     match signal.map(String::as_str) {
         Some("start") => Ok(PowerSignal::Start),
@@ -1570,14 +1578,20 @@ async fn apply_power_signal(
 ) -> Result<()> {
     match signal {
         PowerSignal::Start => {
-            if container_is_running(server.id).await? {
+            let is_running = container_is_running(server.id).await?;
+            registry.set_server_runtime(
+                server.id,
+                runtime_status_after_start_request(is_running),
+                None,
+                None,
+            )?;
+
+            if is_running {
                 registry.append_console_message(
                     server.id,
                     "system",
                     "Start requested, but the server is already running.",
                 )?;
-            } else {
-                registry.set_server_runtime(server.id, "starting", None, None)?;
             }
         }
         PowerSignal::Stop => {
@@ -2976,6 +2990,12 @@ mod tests {
             parse_power_signal(Some(&"reinstall".to_string())).expect("reinstall accepted"),
             PowerSignal::Reinstall
         ));
+    }
+
+    #[test]
+    fn start_requests_keep_running_servers_in_running_state() {
+        assert_eq!(runtime_status_after_start_request(true), "running");
+        assert_eq!(runtime_status_after_start_request(false), "starting");
     }
 
     #[test]
