@@ -15,6 +15,7 @@ const ORANGE: &str = "\x1b[38;2;240;90;36m";
 const ORANGE_DARK: &str = "\x1b[38;2;217;36;0m";
 const GRAY: &str = "\x1b[38;2;120;120;120m";
 const RESET: &str = "\x1b[0m";
+const DEFAULT: &str = "";
 
 pub fn init(config: &LoggingSection, level_override: Option<&str>) -> Result<()> {
     let env_filter = build_env_filter(config, level_override)?;
@@ -67,7 +68,7 @@ where
         event.record(&mut visitor);
 
         if let Some(message) = visitor.message.take() {
-            write!(writer, " {ORANGE}{message}{RESET}")?;
+            write!(writer, " {}{message}{RESET}", message_color(level))?;
         }
 
         if !visitor.fields.is_empty() {
@@ -120,9 +121,19 @@ fn level_color(level: Level) -> &'static str {
     match level {
         Level::ERROR => ORANGE_DARK,
         Level::WARN => ORANGE,
-        Level::INFO => ORANGE,
+        Level::INFO => DEFAULT,
         Level::DEBUG => GRAY,
         Level::TRACE => GRAY,
+    }
+}
+
+fn message_color(level: Level) -> &'static str {
+    match level {
+        Level::ERROR => ORANGE_DARK,
+        Level::WARN => ORANGE,
+        Level::INFO => DEFAULT,
+        Level::DEBUG => DEFAULT,
+        Level::TRACE => DEFAULT,
     }
 }
 
@@ -158,8 +169,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn info_logs_use_orange() {
-        assert_eq!(level_color(Level::INFO), ORANGE);
+    fn info_logs_use_default_colors() {
+        assert_eq!(level_color(Level::INFO), DEFAULT);
+        assert_eq!(message_color(Level::INFO), DEFAULT);
+    }
+
+    #[test]
+    fn warning_logs_keep_orange_colors() {
+        assert_eq!(level_color(Level::WARN), ORANGE);
+        assert_eq!(message_color(Level::WARN), ORANGE);
     }
 
     #[test]

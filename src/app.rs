@@ -14,8 +14,8 @@ use crate::service::HeartbeatService;
 use crate::shutdown;
 
 const ORANGE: &str = "\x1b[38;2;240;90;36m";
-const ORANGE_DARK: &str = "\x1b[38;2;217;36;0m";
 const GRAY: &str = "\x1b[38;2;120;120;120m";
+const WHITE: &str = "\x1b[38;2;255;255;255m";
 const RESET: &str = "\x1b[0m";
 const ASCII_ART: &str = r#"         __                          __      __
    _____/ /____  ______  ____  _____/ /_____/ /
@@ -127,17 +127,17 @@ fn print_startup_banner() {
 
     for line in ASCII_ART.lines() {
         println!(
-            "{orange}{line}{reset}",
-            orange = ORANGE,
+            "{white}{line}{reset}",
+            white = WHITE,
             line = line,
             reset = RESET
         );
     }
 
     println!(
-        "{gray}              skyportd {orange_dark}{version}{reset}",
+        "{gray}              skyportd {orange}{version}{reset}",
         gray = GRAY,
-        orange_dark = ORANGE_DARK,
+        orange = ORANGE,
         version = env!("CARGO_PKG_VERSION"),
         reset = RESET,
     );
