@@ -329,7 +329,19 @@ async fn boot_server(
     )?;
     let mut pull_command = docker_command();
     pull_command.arg("pull").arg(&image);
-    run_quiet_command(pull_command, "failed to pull runtime image").await?;
+    let pull_status = run_streaming_command(
+        pull_command,
+        registry,
+        server.id,
+        "system",
+        cancellation,
+        None,
+    )
+    .await?;
+
+    if !pull_status.success() {
+        bail!("failed to pull runtime image");
+    }
 
     apply_config_file_actions(registry, server, &volume_path).await?;
     remove_container(&runtime_container_name(server.id)).await?;
@@ -1050,24 +1062,6 @@ fn docker_command() -> Command {
     command
 }
 
-async fn run_quiet_command(mut command: Command, context: &str) -> Result<()> {
-    let output = command
-        .output()
-        .await
-        .with_context(|| context.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            bail!(context.to_string());
-        }
-
-        bail!("{context}: {stderr}");
-    }
-
-    Ok(())
-}
-
 async fn run_streaming_command(
     mut command: Command,
     registry: &ServerRegistry,
@@ -1164,10 +1158,14 @@ mod tests {
         ));
         let removed_start_message = ["Starting server", " container..."].concat();
         let removed_config_action_message = ["Applied config file actions", " to"].concat();
+        let system_source = ["\"system\"", ",\n        cancellation,"].concat();
 
         assert!(source.contains("All systems ready! Starting server..."));
         assert!(!source.contains(&removed_start_message));
         assert!(!source.contains(&removed_config_action_message));
+        assert!(source.contains("Pulling runtime image {image}..."));
+        assert!(source.contains("run_streaming_command("));
+        assert!(source.contains(&system_source));
     }
 
     #[test]
