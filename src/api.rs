@@ -22,7 +22,7 @@ use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{DaemonConfig, NodeSection, project_root};
+use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path};
 use crate::configuration;
 use crate::server_registry::{
     ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerLimits,
@@ -109,9 +109,11 @@ struct ServerPayload {
     node_id: u64,
     name: String,
     status: String,
-    volume_path: String,
+    #[serde(rename = "volume_path")]
+    _volume_path: String,
     created_at: String,
     updated_at: String,
+    docker_image: Option<String>,
     allocation: ServerAllocationPayload,
     user: ServerUserPayload,
     limits: ServerLimitsPayload,
@@ -438,6 +440,9 @@ async fn sync_server(
         ));
     }
 
+    let expected_volume_path = format!("volumes/{}", payload.server.id);
+    managed_server_volume_path(payload.server.id).map_err(internal_error)?;
+
     let existing = state
         .server_registry
         .get_server(payload.server.id)
@@ -453,9 +458,10 @@ async fn sync_server(
         node_id: payload.server.node_id,
         name: payload.server.name,
         status: payload.server.status,
-        volume_path: payload.server.volume_path,
+        volume_path: expected_volume_path,
         created_at: payload.server.created_at,
         updated_at: payload.server.updated_at,
+        docker_image: payload.server.docker_image,
         allocation: ManagedServerAllocation {
             id: payload.server.allocation.id,
             bind_ip: payload.server.allocation.bind_ip,
@@ -1024,7 +1030,9 @@ async fn handle_synced_server_update(
 }
 
 fn server_requires_recreate(existing: &ManagedServerRecord, server: &ManagedServerRecord) -> bool {
-    existing.limits != server.limits || existing.allocation != server.allocation
+    existing.limits != server.limits
+        || existing.allocation != server.allocation
+        || existing.docker_image != server.docker_image
 }
 
 async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
@@ -1514,7 +1522,7 @@ fn docker_command() -> Command {
 }
 
 fn resolve_volume_path(server: &ManagedServerRecord) -> Result<PathBuf> {
-    Ok(project_root()?.join(&server.volume_path))
+    managed_server_volume_path(server.id)
 }
 
 async fn current_disk_usage_bytes(server: &ManagedServerRecord) -> Result<u64> {
@@ -1660,6 +1668,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_volume_path_uses_server_id_instead_of_payload_path() {
+        let mut server = sample_managed_server();
+        server.volume_path = "../../etc".to_string();
+
+        let path = resolve_volume_path(&server).expect("volume path should resolve");
+
+        assert!(path.ends_with("volumes/1"));
+    }
+
+    #[test]
     fn auth_event_requires_matching_token() {
         let payload_hex = hex_encode(
             serde_json::to_string(&WsTokenPayload {
@@ -1722,15 +1740,18 @@ mod tests {
     }
 
     #[test]
-    fn synced_server_recreate_detection_tracks_limits_and_allocations() {
+    fn synced_server_recreate_detection_tracks_limits_allocations_and_docker_image() {
         let existing = sample_managed_server();
         let mut updated_limits = sample_managed_server();
         updated_limits.limits.memory_mib = 2048;
         let mut updated_allocation = sample_managed_server();
         updated_allocation.allocation.port = 25566;
+        let mut updated_docker_image = sample_managed_server();
+        updated_docker_image.docker_image = Some("ghcr.io/skyportsh/yolks:java_21".to_string());
 
         assert!(server_requires_recreate(&existing, &updated_limits));
         assert!(server_requires_recreate(&existing, &updated_allocation));
+        assert!(server_requires_recreate(&existing, &updated_docker_image));
         assert!(!server_requires_recreate(
             &existing,
             &sample_managed_server()
@@ -1753,6 +1774,7 @@ mod tests {
             volume_path: "volumes/1".to_string(),
             created_at: "2026-04-06T00:00:00Z".to_string(),
             updated_at: "2026-04-06T00:00:00Z".to_string(),
+            docker_image: None,
             allocation: ManagedServerAllocation {
                 id: 1,
                 bind_ip: "0.0.0.0".to_string(),

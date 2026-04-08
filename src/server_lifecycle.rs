@@ -18,7 +18,7 @@ use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{DaemonConfig, project_root};
+use crate::config::{DaemonConfig, managed_server_volume_path, safe_join_relative};
 use crate::server_registry::{ManagedServerCargo, ManagedServerRecord, ServerRegistry};
 
 pub struct ServerLifecycleService {
@@ -321,7 +321,7 @@ async fn boot_server(
     registry.append_console_message(server.id, "system", "Checking disk space limits...")?;
     ensure_disk_limit(&volume_path, server.limits.disk_mib)?;
 
-    let image = select_runtime_image(&server.cargo)?;
+    let image = select_runtime_image(server)?;
     registry.append_console_message(
         server.id,
         "system",
@@ -615,7 +615,7 @@ async fn apply_config_file_actions(
 
         match parser {
             "properties" => {
-                let file_path = volume_path.join(relative_path);
+                let file_path = safe_join_relative(volume_path, relative_path)?;
                 let mut replacements = BTreeMap::new();
                 if let Some(find) = rule.get("find").and_then(Value::as_object) {
                     for (key, value) in find {
@@ -927,7 +927,7 @@ async fn notify_panel_runtime_update(
 }
 
 fn resolve_volume_path(_config: &DaemonConfig, server: &ManagedServerRecord) -> Result<PathBuf> {
-    Ok(project_root()?.join(&server.volume_path))
+    managed_server_volume_path(server.id)
 }
 
 fn ensure_disk_limit(path: &Path, disk_limit_mib: u64) -> Result<()> {
@@ -967,12 +967,24 @@ fn directory_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn select_runtime_image(cargo: &ManagedServerCargo) -> Result<String> {
-    if let Some(image) = highest_java_runtime_image(&cargo.docker_images) {
+fn select_runtime_image(server: &ManagedServerRecord) -> Result<String> {
+    if let Some(image) = &server.docker_image {
+        if server
+            .cargo
+            .docker_images
+            .values()
+            .any(|value| value == image)
+        {
+            return Ok(image.clone());
+        }
+    }
+
+    if let Some(image) = highest_java_runtime_image(&server.cargo.docker_images) {
         return Ok(image);
     }
 
-    cargo
+    server
+        .cargo
         .docker_images
         .values()
         .next()
@@ -1109,6 +1121,7 @@ async fn run_streaming_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_registry::ServerRegistry;
     use tempfile::tempdir;
 
     #[test]
@@ -1130,6 +1143,18 @@ mod tests {
             highest_java_runtime_image(&images),
             Some("java-25".to_string())
         );
+    }
+
+    #[test]
+    fn select_runtime_image_prefers_the_server_override() {
+        let mut server = sample_server();
+        server.cargo.docker_images = BTreeMap::from([
+            ("Java 21".to_string(), "java-21".to_string()),
+            ("Java 17".to_string(), "java-17".to_string()),
+        ]);
+        server.docker_image = Some("java-17".to_string());
+
+        assert_eq!(select_runtime_image(&server).unwrap(), "java-17");
     }
 
     #[test]
@@ -1160,6 +1185,26 @@ mod tests {
         let contents = std::fs::read_to_string(file).unwrap();
         assert!(contents.contains("server-ip=0.0.0.0"));
         assert!(contents.contains("server-port=25565"));
+    }
+
+    #[tokio::test]
+    async fn config_file_actions_reject_paths_outside_the_server_volume() {
+        let tempdir = tempdir().unwrap();
+        let registry = ServerRegistry::new(tempdir.path().join("skyportd.db"));
+        registry.initialize().unwrap();
+
+        let mut server = sample_server();
+        server.cargo.config_files =
+            r#"{"../../host.properties":{"parser":"properties","find":{"motd":"Hello"}}}"#
+                .to_string();
+
+        let error = apply_config_file_actions(&registry, &server, tempdir.path())
+            .await
+            .expect_err("path traversal should be rejected")
+            .to_string();
+
+        assert!(error.contains("within the server volume"));
+        assert!(!tempdir.path().join("../../host.properties").exists());
     }
 
     #[test]
@@ -1218,6 +1263,7 @@ mod tests {
             volume_path: "volumes/1".to_string(),
             created_at: "2026-04-06T00:00:00Z".to_string(),
             updated_at: "2026-04-06T00:00:00Z".to_string(),
+            docker_image: None,
             allocation: crate::server_registry::ManagedServerAllocation {
                 id: 1,
                 bind_ip: "0.0.0.0".to_string(),

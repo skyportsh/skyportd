@@ -23,6 +23,7 @@ pub struct ManagedServerRecord {
     pub volume_path: String,
     pub created_at: String,
     pub updated_at: String,
+    pub docker_image: Option<String>,
     pub allocation: ManagedServerAllocation,
     pub container_id: Option<String>,
     pub last_error: Option<String>,
@@ -127,6 +128,7 @@ impl ServerRegistry {
                 volume_path TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                docker_image TEXT,
                 user_id INTEGER NOT NULL,
                 user_name TEXT NOT NULL,
                 user_email TEXT NOT NULL,
@@ -190,6 +192,7 @@ impl ServerRegistry {
             r#"
             INSERT INTO servers (
                 id, node_id, name, status, volume_path, created_at, updated_at,
+                docker_image,
                 user_id, user_name, user_email,
                 memory_mib, cpu_limit, disk_mib,
                 cargo_id, cargo_name, cargo_slug, cargo_source_type,
@@ -199,13 +202,14 @@ impl ServerRegistry {
                 variables_json, definition_json, allocation_json, container_id, last_error
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10,
-                ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20, ?21, ?22,
-                ?23, ?24, ?25,
-                ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34
+                ?8,
+                ?9, ?10, ?11,
+                ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21, ?22, ?23,
+                ?24, ?25, ?26,
+                ?27, ?28, ?29, ?30,
+                ?31, ?32, ?33, ?34, ?35
             )
             ON CONFLICT(id) DO UPDATE SET
                 node_id = excluded.node_id,
@@ -214,6 +218,7 @@ impl ServerRegistry {
                 volume_path = excluded.volume_path,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
+                docker_image = excluded.docker_image,
                 user_id = excluded.user_id,
                 user_name = excluded.user_name,
                 user_email = excluded.user_email,
@@ -250,6 +255,7 @@ impl ServerRegistry {
                 server.volume_path,
                 server.created_at,
                 server.updated_at,
+                server.docker_image,
                 server.user.id,
                 server.user.name,
                 server.user.email,
@@ -444,6 +450,13 @@ impl ServerRegistry {
 
         if !existing_columns
             .iter()
+            .any(|column| column == "docker_image")
+        {
+            connection.execute("ALTER TABLE servers ADD COLUMN docker_image TEXT", [])?;
+        }
+
+        if !existing_columns
+            .iter()
             .any(|column| column == "allocation_json")
         {
             connection.execute(
@@ -499,6 +512,7 @@ struct ServerRuntime {
 const SERVER_SELECT_SQL: &str = r#"
 SELECT
     id, node_id, name, status, volume_path, created_at, updated_at,
+    docker_image,
     user_id, user_name, user_email,
     memory_mib, cpu_limit, disk_mib,
     cargo_id, cargo_name, cargo_slug, cargo_source_type,
@@ -518,38 +532,39 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
         volume_path: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
-        allocation: parse_json(row.get::<_, String>(31)?)?,
-        container_id: row.get(32)?,
-        last_error: row.get(33)?,
+        docker_image: row.get(7)?,
+        allocation: parse_json(row.get::<_, String>(32)?)?,
+        container_id: row.get(33)?,
+        last_error: row.get(34)?,
         user: ManagedServerUser {
-            id: row.get(7)?,
-            name: row.get(8)?,
-            email: row.get(9)?,
+            id: row.get(8)?,
+            name: row.get(9)?,
+            email: row.get(10)?,
         },
         limits: ManagedServerLimits {
-            memory_mib: row.get(10)?,
-            cpu_limit: row.get(11)?,
-            disk_mib: row.get(12)?,
+            memory_mib: row.get(11)?,
+            cpu_limit: row.get(12)?,
+            disk_mib: row.get(13)?,
         },
         cargo: ManagedServerCargo {
-            id: row.get(13)?,
-            name: row.get(14)?,
-            slug: row.get(15)?,
-            source_type: row.get(16)?,
-            startup_command: row.get(17)?,
-            config_files: row.get(18)?,
-            config_startup: row.get(19)?,
-            config_logs: row.get(20)?,
-            config_stop: row.get(21)?,
-            install_script: row.get(22)?,
-            install_container: row.get(23)?,
-            install_entrypoint: row.get(24)?,
-            features: parse_json(row.get::<_, String>(25)?)?,
-            docker_images: parse_json(row.get::<_, String>(26)?)?,
-            file_denylist: parse_json(row.get::<_, String>(27)?)?,
-            file_hidden_list: parse_json(row.get::<_, String>(28)?)?,
-            variables: parse_json(row.get::<_, String>(29)?)?,
-            definition: parse_json(row.get::<_, String>(30)?)?,
+            id: row.get(14)?,
+            name: row.get(15)?,
+            slug: row.get(16)?,
+            source_type: row.get(17)?,
+            startup_command: row.get(18)?,
+            config_files: row.get(19)?,
+            config_startup: row.get(20)?,
+            config_logs: row.get(21)?,
+            config_stop: row.get(22)?,
+            install_script: row.get(23)?,
+            install_container: row.get(24)?,
+            install_entrypoint: row.get(25)?,
+            features: parse_json(row.get::<_, String>(26)?)?,
+            docker_images: parse_json(row.get::<_, String>(27)?)?,
+            file_denylist: parse_json(row.get::<_, String>(28)?)?,
+            file_hidden_list: parse_json(row.get::<_, String>(29)?)?,
+            variables: parse_json(row.get::<_, String>(30)?)?,
+            definition: parse_json(row.get::<_, String>(31)?)?,
         },
     })
 }
@@ -586,6 +601,7 @@ mod tests {
             volume_path: "volumes/42".to_string(),
             created_at: "2026-04-06T12:00:00Z".to_string(),
             updated_at: "2026-04-06T12:00:00Z".to_string(),
+            docker_image: None,
             container_id: None,
             last_error: None,
             user: ManagedServerUser {
