@@ -2287,7 +2287,6 @@ fn create_archive(server: &ManagedServerRecord, paths: &[String], requested_path
     let output = std::process::Command::new("zip")
         .current_dir(&volume_path)
         .arg("-rq")
-        .arg("--")
         .arg(&archive_path)
         .args(&normalized_paths)
         .output()
@@ -2551,7 +2550,7 @@ fn archive_source_paths(
             bail!("The archive cannot contain itself.");
         }
 
-        normalized_paths.push(normalized_path);
+        normalized_paths.push(format!("./{normalized_path}"));
     }
 
     Ok(normalized_paths)
@@ -3076,6 +3075,36 @@ mod tests {
         .to_string();
 
         assert!(error.contains("within the server volume"));
+    }
+
+    #[test]
+    fn create_archive_creates_zip_from_selected_paths() {
+        let server_id = current_unix_timestamp();
+        let mut server = sample_managed_server();
+        server.id = server_id;
+
+        let volume_path = resolve_volume_path(&server).expect("volume path should resolve");
+        let _ = std::fs::remove_dir_all(&volume_path);
+        std::fs::create_dir_all(volume_path.join("plugins")).unwrap();
+        std::fs::write(volume_path.join("server.properties"), "motd=Hello").unwrap();
+        std::fs::write(volume_path.join("plugins/plugin.jar"), "jar").unwrap();
+
+        create_archive(
+            &server,
+            &["server.properties".to_string(), "plugins".to_string()],
+            "",
+            "backup.zip",
+        )
+        .expect("archive should be created");
+
+        let archive_path = volume_path.join("backup.zip");
+        assert!(archive_path.exists());
+
+        let entries = list_archive_entries(&archive_path).expect("archive should be readable");
+        assert!(entries.iter().any(|entry| entry == "server.properties"));
+        assert!(entries.iter().any(|entry| entry == "plugins/plugin.jar"));
+
+        let _ = std::fs::remove_dir_all(&volume_path);
     }
 
     fn current_unix_timestamp() -> u64 {
