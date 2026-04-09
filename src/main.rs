@@ -26,8 +26,12 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
-    let config = DaemonConfig::load()?;
+    let mut config = DaemonConfig::load()?;
     logging::init(&config.logging, options.log_level_override())?;
+
+    if options.configure {
+        config.clear_enrollment()?;
+    }
 
     let config = configuration::ensure_configured(config).await?;
 
@@ -38,6 +42,7 @@ async fn main() -> Result<()> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CliOptions {
+    configure: bool,
     debug: bool,
     help: bool,
 }
@@ -48,6 +53,9 @@ impl CliOptions {
 
         for arg in args {
             match arg.as_str() {
+                "--configure" => {
+                    options.configure = true;
+                }
                 "--debug" | "-d" => {
                     options.debug = true;
                 }
@@ -74,13 +82,28 @@ fn print_help() {
     println!("Usage: skyportd [OPTIONS]");
     println!();
     println!("Options:");
-    println!("  -d, --debug    Enable verbose debug logging");
-    println!("  -h, --help     Show this help message");
+    println!("      --configure  Re-run the configuration prompt");
+    println!("  -d, --debug      Enable verbose debug logging");
+    println!("  -h, --help       Show this help message");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_configure_flag() {
+        let options = CliOptions::parse(["--configure".to_string()]).unwrap();
+
+        assert_eq!(
+            options,
+            CliOptions {
+                configure: true,
+                debug: false,
+                help: false,
+            }
+        );
+    }
 
     #[test]
     fn parse_debug_flag() {
@@ -89,8 +112,9 @@ mod tests {
         assert_eq!(
             options,
             CliOptions {
+                configure: false,
                 debug: true,
-                help: false
+                help: false,
             }
         );
         assert_eq!(options.log_level_override(), Some("debug"));
@@ -103,8 +127,9 @@ mod tests {
         assert_eq!(
             options,
             CliOptions {
+                configure: false,
                 debug: false,
-                help: true
+                help: true,
             }
         );
     }

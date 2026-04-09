@@ -124,6 +124,28 @@ impl DaemonConfig {
         write_local_table(&local_path, &local)
     }
 
+    pub fn clear_enrollment(&mut self) -> Result<()> {
+        self.panel.daemon_secret = None;
+        self.panel.daemon_callback_token = None;
+        self.panel.node_id = None;
+        self.panel.configuration_token = None;
+
+        let local_path = local_config_path()?;
+        let mut local = load_local_table(&local_path)?;
+
+        if let Some(panel) = local
+            .get_mut("panel")
+            .and_then(toml::Value::as_table_mut)
+        {
+            panel.remove("daemon_secret");
+            panel.remove("daemon_callback_token");
+            panel.remove("node_id");
+            panel.remove("configuration_token");
+        }
+
+        write_local_table(&local_path, &local)
+    }
+
     pub fn persist_node_tls_paths(&self, cert_path: &str, key_path: &str) -> Result<()> {
         let local_path = local_config_path()?;
         let mut local = load_local_table(&local_path)?;
