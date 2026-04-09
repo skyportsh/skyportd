@@ -1,0 +1,127 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.check.outputs.skip }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release needed
+        id: check
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          tag="${{ steps.version.outputs.tag }}"
+
+          if [[ "$version" == *-dev* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: version $version ends in -dev"
+            exit 0
+          fi
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: release $tag already exists"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Will create release $tag"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: skyportd-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: skyportd-linux-aarch64
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: skyportd-linux-riscv64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        run: |
+          cp target/${{ matrix.target }}/release/skyportd ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        run: |
+          gh release create "${{ needs.check.outputs.tag }}" \
+            --title "skyportd ${{ needs.check.outputs.tag }}" \
+            --generate-notes \
+            artifacts/skyportd-linux-x86_64/skyportd-linux-x86_64 \
+            artifacts/skyportd-linux-aarch64/skyportd-linux-aarch64 \
+            artifacts/skyportd-linux-riscv64/skyportd-linux-riscv64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
