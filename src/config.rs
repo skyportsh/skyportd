@@ -133,10 +133,7 @@ impl DaemonConfig {
         let local_path = local_config_path()?;
         let mut local = load_local_table(&local_path)?;
 
-        if let Some(panel) = local
-            .get_mut("panel")
-            .and_then(toml::Value::as_table_mut)
-        {
+        if let Some(panel) = local.get_mut("panel").and_then(toml::Value::as_table_mut) {
             panel.remove("daemon_secret");
             panel.remove("daemon_callback_token");
             panel.remove("node_id");

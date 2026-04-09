@@ -6,8 +6,8 @@ use std::path::{Path as StdPath, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -759,7 +759,8 @@ async fn write_server_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerFileContentsRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -783,7 +784,8 @@ async fn create_server_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerCreateFilesystemEntryRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -807,7 +809,8 @@ async fn create_server_directory(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerCreateFilesystemEntryRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -831,7 +834,8 @@ async fn delete_server_files(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerDeleteFilesRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -860,18 +864,21 @@ async fn rename_server_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerRenameFilesystemEntryRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
     ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
-    tokio::task::spawn_blocking(move || rename_filesystem_entry(&server, &payload.path, &payload.name))
-        .await
-        .context("failed to join file rename task")
-        .map_err(internal_error)?
-        .map_err(filesystem_error)?;
+    tokio::task::spawn_blocking(move || {
+        rename_filesystem_entry(&server, &payload.path, &payload.name)
+    })
+    .await
+    .context("failed to join file rename task")
+    .map_err(internal_error)?
+    .map_err(filesystem_error)?;
 
     Ok(Json(ServerFilesystemMutationResponse {
         message: "Item renamed successfully.".to_string(),
@@ -884,7 +891,8 @@ async fn move_server_files(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerTransferFilesRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -913,7 +921,8 @@ async fn copy_server_files(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerTransferFilesRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -942,18 +951,21 @@ async fn update_server_file_permissions(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerUpdatePermissionsRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
     ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
-    tokio::task::spawn_blocking(move || update_file_permissions(&server, &payload.paths, &payload.permissions))
-        .await
-        .context("failed to join permissions update task")
-        .map_err(internal_error)?
-        .map_err(filesystem_error)?;
+    tokio::task::spawn_blocking(move || {
+        update_file_permissions(&server, &payload.paths, &payload.permissions)
+    })
+    .await
+    .context("failed to join permissions update task")
+    .map_err(internal_error)?
+    .map_err(filesystem_error)?;
 
     Ok(Json(ServerFilesystemMutationResponse {
         message: "Permissions updated successfully.".to_string(),
@@ -966,18 +978,21 @@ async fn create_server_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerArchiveFilesRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
     ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
-    tokio::task::spawn_blocking(move || create_archive(&server, &payload.paths, &payload.path, &payload.name))
-        .await
-        .context("failed to join archive creation task")
-        .map_err(internal_error)?
-        .map_err(filesystem_error)?;
+    tokio::task::spawn_blocking(move || {
+        create_archive(&server, &payload.paths, &payload.path, &payload.name)
+    })
+    .await
+    .context("failed to join archive creation task")
+    .map_err(internal_error)?
+    .map_err(filesystem_error)?;
 
     Ok(Json(ServerFilesystemMutationResponse {
         message: "Archive created successfully.".to_string(),
@@ -990,7 +1005,8 @@ async fn extract_server_archive(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<ServerExtractArchiveRequest>,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -1016,7 +1032,8 @@ async fn upload_server_file(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Bytes,
-) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
+{
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
@@ -1429,11 +1446,7 @@ fn authenticate_ws_event(
 }
 
 fn runtime_status_after_start_request(is_running: bool) -> &'static str {
-    if is_running {
-        "running"
-    } else {
-        "starting"
-    }
+    if is_running { "running" } else { "starting" }
 }
 
 fn parse_power_signal(signal: Option<&String>) -> Result<PowerSignal> {
@@ -2047,7 +2060,10 @@ fn directory_size(path: &StdPath) -> Result<u64> {
     Ok(total)
 }
 
-fn list_directory(server: &ManagedServerRecord, requested_path: &str) -> Result<DirectoryListingPayload> {
+fn list_directory(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+) -> Result<DirectoryListingPayload> {
     let volume_path = ensure_server_volume(server)?;
     let normalized_path = normalize_relative_path(requested_path)?;
     let directory_path = resolve_existing_server_path(&volume_path, &normalized_path)?;
@@ -2077,7 +2093,10 @@ fn list_directory(server: &ManagedServerRecord, requested_path: &str) -> Result<
     })
 }
 
-fn read_text_file(server: &ManagedServerRecord, requested_path: &str) -> Result<FileContentsPayload> {
+fn read_text_file(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+) -> Result<FileContentsPayload> {
     let volume_path = ensure_server_volume(server)?;
     let normalized_path = normalize_relative_path(requested_path)?;
 
@@ -2097,8 +2116,8 @@ fn read_text_file(server: &ManagedServerRecord, requested_path: &str) -> Result<
         bail!("This file is too large to open in the editor.");
     }
 
-    let bytes = fs::read(&file_path)
-        .with_context(|| format!("failed to read {}", file_path.display()))?;
+    let bytes =
+        fs::read(&file_path).with_context(|| format!("failed to read {}", file_path.display()))?;
 
     if bytes.contains(&0) {
         bail!("This file could not be opened as text.");
@@ -2115,7 +2134,11 @@ fn read_text_file(server: &ManagedServerRecord, requested_path: &str) -> Result<
     })
 }
 
-fn write_text_file(server: &ManagedServerRecord, requested_path: &str, contents: &str) -> Result<()> {
+fn write_text_file(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+    contents: &str,
+) -> Result<()> {
     if contents.len() > 2 * 1024 * 1024 {
         bail!("This file is too large to save through the editor.");
     }
@@ -2141,10 +2164,8 @@ fn write_text_file(server: &ManagedServerRecord, requested_path: &str, contents:
 
 fn create_file(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
-    let directory_path = resolve_existing_server_path(
-        &volume_path,
-        &normalize_relative_path(requested_path)?,
-    )?;
+    let directory_path =
+        resolve_existing_server_path(&volume_path, &normalize_relative_path(requested_path)?)?;
 
     if !fs::metadata(&directory_path)?.is_dir() {
         bail!("The requested path is not a directory.");
@@ -2163,10 +2184,8 @@ fn create_file(server: &ManagedServerRecord, requested_path: &str, name: &str) -
 
 fn create_directory(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
-    let directory_path = resolve_existing_server_path(
-        &volume_path,
-        &normalize_relative_path(requested_path)?,
-    )?;
+    let directory_path =
+        resolve_existing_server_path(&volume_path, &normalize_relative_path(requested_path)?)?;
 
     if !fs::metadata(&directory_path)?.is_dir() {
         bail!("The requested path is not a directory.");
@@ -2210,7 +2229,11 @@ fn delete_files(server: &ManagedServerRecord, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn rename_filesystem_entry(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
+fn rename_filesystem_entry(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+    name: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let normalized_path = normalize_relative_path(requested_path)?;
 
@@ -2261,7 +2284,11 @@ fn copy_files(server: &ManagedServerRecord, paths: &[String], destination: &str)
     Ok(())
 }
 
-fn update_file_permissions(server: &ManagedServerRecord, paths: &[String], permissions: &str) -> Result<()> {
+fn update_file_permissions(
+    server: &ManagedServerRecord,
+    paths: &[String],
+    permissions: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let mode = normalize_permissions(permissions)?;
 
@@ -2281,14 +2308,20 @@ fn update_file_permissions(server: &ManagedServerRecord, paths: &[String], permi
             .with_context(|| format!("failed to read metadata for {}", target_path.display()))?
             .permissions();
         target_permissions.set_mode(mode);
-        fs::set_permissions(&target_path, target_permissions)
-            .with_context(|| format!("failed to update permissions for {}", target_path.display()))?;
+        fs::set_permissions(&target_path, target_permissions).with_context(|| {
+            format!("failed to update permissions for {}", target_path.display())
+        })?;
     }
 
     Ok(())
 }
 
-fn create_archive(server: &ManagedServerRecord, paths: &[String], requested_path: &str, name: &str) -> Result<()> {
+fn create_archive(
+    server: &ManagedServerRecord,
+    paths: &[String],
+    requested_path: &str,
+    name: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let destination_path = resolve_destination_directory(&volume_path, requested_path)?;
     let archive_path = destination_path.join(archive_file_name(name)?);
@@ -2308,13 +2341,20 @@ fn create_archive(server: &ManagedServerRecord, paths: &[String], requested_path
 
     if !output.status.success() {
         let _ = fs::remove_file(&archive_path);
-        bail!(command_output_message(&output.stderr, "The archive could not be created."));
+        bail!(command_output_message(
+            &output.stderr,
+            "The archive could not be created."
+        ));
     }
 
     Ok(())
 }
 
-fn extract_archive(server: &ManagedServerRecord, requested_path: &str, destination: &str) -> Result<()> {
+fn extract_archive(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+    destination: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let normalized_archive_path = normalize_relative_path(requested_path)?;
 
@@ -2348,7 +2388,10 @@ fn extract_archive(server: &ManagedServerRecord, requested_path: &str, destinati
             .context("failed to execute unzip")?;
 
         if !output.status.success() {
-            bail!(command_output_message(&output.stderr, "The archive could not be extracted."));
+            bail!(command_output_message(
+                &output.stderr,
+                "The archive could not be extracted."
+            ));
         }
 
         ensure_tree_contains_no_symlinks(&temp_path)?;
@@ -2362,7 +2405,10 @@ fn extract_archive(server: &ManagedServerRecord, requested_path: &str, destinati
             }
 
             if target_path.exists() {
-                bail!(format!("{} already exists in the destination.", target_path.display()));
+                bail!(format!(
+                    "{} already exists in the destination.",
+                    target_path.display()
+                ));
             }
 
             move_path_recursive(&source_path, &target_path)?;
@@ -2379,7 +2425,12 @@ fn extract_archive(server: &ManagedServerRecord, requested_path: &str, destinati
     Ok(())
 }
 
-fn upload_file(server: &ManagedServerRecord, requested_path: &str, name: &str, bytes: &[u8]) -> Result<()> {
+fn upload_file(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Result<()> {
     if bytes.len() > 100 * 1024 * 1024 {
         bail!("Uploaded files may not be larger than 100 MB.");
     }
@@ -2399,7 +2450,8 @@ fn upload_file(server: &ManagedServerRecord, requested_path: &str, name: &str, b
 }
 
 fn resolve_destination_directory(volume_path: &PathBuf, destination: &str) -> Result<PathBuf> {
-    let destination_path = resolve_existing_server_path(volume_path, &normalize_relative_path(destination)?)?;
+    let destination_path =
+        resolve_existing_server_path(volume_path, &normalize_relative_path(destination)?)?;
 
     if !fs::metadata(&destination_path)
         .with_context(|| format!("failed to read metadata for {}", destination_path.display()))?
@@ -2472,14 +2524,16 @@ fn copy_path_recursive(source_path: &PathBuf, target_path: &PathBuf) -> Result<(
         for entry in fs::read_dir(source_path)
             .with_context(|| format!("failed to read {}", source_path.display()))?
         {
-            let entry = entry.with_context(|| format!("failed to read {}", source_path.display()))?;
+            let entry =
+                entry.with_context(|| format!("failed to read {}", source_path.display()))?;
             let child_source = entry.path();
             let child_target = target_path.join(entry.file_name());
             copy_path_recursive(&child_source, &child_target)?;
         }
 
-        fs::set_permissions(target_path, metadata.permissions())
-            .with_context(|| format!("failed to update permissions for {}", target_path.display()))?;
+        fs::set_permissions(target_path, metadata.permissions()).with_context(|| {
+            format!("failed to update permissions for {}", target_path.display())
+        })?;
     } else {
         fs::copy(source_path, target_path).with_context(|| {
             format!(
@@ -2488,8 +2542,9 @@ fn copy_path_recursive(source_path: &PathBuf, target_path: &PathBuf) -> Result<(
                 target_path.display()
             )
         })?;
-        fs::set_permissions(target_path, metadata.permissions())
-            .with_context(|| format!("failed to update permissions for {}", target_path.display()))?;
+        fs::set_permissions(target_path, metadata.permissions()).with_context(|| {
+            format!("failed to update permissions for {}", target_path.display())
+        })?;
     }
 
     Ok(())
@@ -2521,9 +2576,17 @@ fn remove_path_recursive(path: &PathBuf) -> Result<()> {
 fn normalize_permissions(permissions: &str) -> Result<u32> {
     let trimmed = permissions.trim();
     let normalized = trimmed.trim_start_matches('0');
-    let normalized = if normalized.is_empty() { "000" } else { normalized };
+    let normalized = if normalized.is_empty() {
+        "000"
+    } else {
+        normalized
+    };
 
-    if normalized.len() != 3 || normalized.chars().any(|character| !('0'..='7').contains(&character)) {
+    if normalized.len() != 3
+        || normalized
+            .chars()
+            .any(|character| !('0'..='7').contains(&character))
+    {
         bail!("Please enter a valid permission mode such as 644 or 755.");
     }
 
@@ -2578,7 +2641,10 @@ fn list_archive_entries(archive_path: &PathBuf) -> Result<Vec<String>> {
         .context("failed to inspect archive contents")?;
 
     if !output.status.success() {
-        bail!(command_output_message(&output.stderr, "The archive could not be inspected."));
+        bail!(command_output_message(
+            &output.stderr,
+            "The archive could not be inspected."
+        ));
     }
 
     Ok(String::from_utf8(output.stdout)
@@ -2619,7 +2685,9 @@ fn ensure_tree_contains_no_symlinks(path: &PathBuf) -> Result<()> {
     }
 
     if metadata.is_dir() {
-        for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
             let entry = entry.with_context(|| format!("failed to read {}", path.display()))?;
             ensure_tree_contains_no_symlinks(&entry.path())?;
         }
@@ -2656,7 +2724,10 @@ fn command_output_message(stderr: &[u8], fallback: &str) -> String {
     }
 }
 
-fn filesystem_entry_payload(volume_path: &PathBuf, entry_path: PathBuf) -> Result<Option<FilesystemEntryPayload>> {
+fn filesystem_entry_payload(
+    volume_path: &PathBuf,
+    entry_path: PathBuf,
+) -> Result<Option<FilesystemEntryPayload>> {
     let symlink_metadata = fs::symlink_metadata(&entry_path)
         .with_context(|| format!("failed to read metadata for {}", entry_path.display()))?;
 
@@ -2687,7 +2758,11 @@ fn filesystem_entry_payload(volume_path: &PathBuf, entry_path: PathBuf) -> Resul
         name,
         path: relative_path,
         permissions: Some(format_permissions(metadata.permissions().mode())),
-        size_bytes: if metadata.is_file() { Some(metadata.len()) } else { None },
+        size_bytes: if metadata.is_file() {
+            Some(metadata.len())
+        } else {
+            None
+        },
     }))
 }
 
@@ -2708,9 +2783,13 @@ fn normalize_relative_path(path: &str) -> Result<String> {
 
     for component in StdPath::new(path).components() {
         match component {
-            std::path::Component::Normal(segment) => segments.push(segment.to_string_lossy().to_string()),
+            std::path::Component::Normal(segment) => {
+                segments.push(segment.to_string_lossy().to_string())
+            }
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
                 bail!("path must stay within the server volume");
             }
         }
@@ -2749,7 +2828,9 @@ fn resolve_server_path_for_write(volume_path: &PathBuf, relative_path: &str) -> 
         return Ok(resolved);
     }
 
-    let parent = candidate.parent().context("path must stay within the server volume")?;
+    let parent = candidate
+        .parent()
+        .context("path must stay within the server volume")?;
     let resolved_parent = fs::canonicalize(parent)
         .with_context(|| format!("failed to resolve {}", parent.display()))?;
 
@@ -2757,7 +2838,9 @@ fn resolve_server_path_for_write(volume_path: &PathBuf, relative_path: &str) -> 
         bail!("path must stay within the server volume");
     }
 
-    let name = candidate.file_name().context("path must stay within the server volume")?;
+    let name = candidate
+        .file_name()
+        .context("path must stay within the server volume")?;
 
     Ok(resolved_parent.join(name))
 }
