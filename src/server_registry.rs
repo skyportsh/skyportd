@@ -25,6 +25,7 @@ pub struct ManagedServerRecord {
     pub updated_at: String,
     pub docker_image: Option<String>,
     pub allocation: ManagedServerAllocation,
+    pub interconnects: Vec<ManagedServerInterconnect>,
     pub firewall_rules: Vec<ManagedServerFirewallRule>,
     pub container_id: Option<String>,
     pub last_error: Option<String>,
@@ -45,6 +46,12 @@ pub struct ManagedServerLimits {
     pub memory_mib: u64,
     pub cpu_limit: u64,
     pub disk_mib: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedServerInterconnect {
+    pub id: u64,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +174,7 @@ impl ServerRegistry {
                 definition_json TEXT NOT NULL,
                 allocation_json TEXT NOT NULL DEFAULT '{}',
                 firewall_rules_json TEXT NOT NULL DEFAULT '[]',
+                interconnects_json TEXT NOT NULL DEFAULT '[]',
                 container_id TEXT,
                 last_error TEXT
             );
@@ -212,7 +220,7 @@ impl ServerRegistry {
                 startup_command, config_files, config_startup, config_logs, config_stop,
                 install_script, install_container, install_entrypoint,
                 features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-                variables_json, definition_json, allocation_json, firewall_rules_json, container_id, last_error
+                variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, container_id, last_error
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8,
@@ -222,7 +230,7 @@ impl ServerRegistry {
                 ?19, ?20, ?21, ?22, ?23,
                 ?24, ?25, ?26,
                 ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37
             )
             ON CONFLICT(id) DO UPDATE SET
                 node_id = excluded.node_id,
@@ -258,6 +266,7 @@ impl ServerRegistry {
                 definition_json = excluded.definition_json,
                 allocation_json = excluded.allocation_json,
                 firewall_rules_json = excluded.firewall_rules_json,
+                interconnects_json = excluded.interconnects_json,
                 container_id = excluded.container_id,
                 last_error = excluded.last_error
             "#,
@@ -296,6 +305,7 @@ impl ServerRegistry {
                 serde_json::to_string(&server.cargo.definition)?,
                 serde_json::to_string(&server.allocation)?,
                 serde_json::to_string(&server.firewall_rules)?,
+                serde_json::to_string(&server.interconnects)?,
                 container_id,
                 last_error,
             ],
@@ -490,6 +500,16 @@ impl ServerRegistry {
             )?;
         }
 
+        if !existing_columns
+            .iter()
+            .any(|column| column == "interconnects_json")
+        {
+            connection.execute(
+                "ALTER TABLE servers ADD COLUMN interconnects_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -544,7 +564,7 @@ SELECT
     startup_command, config_files, config_startup, config_logs, config_stop,
     install_script, install_container, install_entrypoint,
     features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-    variables_json, definition_json, allocation_json, firewall_rules_json, container_id, last_error
+    variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, container_id, last_error
 FROM servers
 "#;
 
@@ -560,8 +580,9 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
         docker_image: row.get(7)?,
         allocation: parse_json(row.get::<_, String>(32)?)?,
         firewall_rules: parse_json(row.get::<_, String>(33)?)?,
-        container_id: row.get(34)?,
-        last_error: row.get(35)?,
+        interconnects: parse_json(row.get::<_, String>(34)?)?,
+        container_id: row.get(35)?,
+        last_error: row.get(36)?,
         user: ManagedServerUser {
             id: row.get(8)?,
             name: row.get(9)?,
@@ -679,6 +700,7 @@ mod tests {
                 ip_alias: Some("play.example.com".to_string()),
             },
             firewall_rules: vec![],
+            interconnects: vec![],
         };
 
         registry.upsert_server(&server).unwrap();

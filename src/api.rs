@@ -28,7 +28,8 @@ use tracing::{info, warn};
 use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, safe_join_relative};
 use crate::configuration;
 use crate::server_registry::{
-    ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule, ManagedServerLimits,
+    ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule,
+    ManagedServerInterconnect, ManagedServerLimits,
     ManagedServerRecord, ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
 
@@ -234,6 +235,14 @@ struct ServerPayload {
     cargo: ServerCargoPayload,
     #[serde(default)]
     firewall_rules: Vec<ServerFirewallRulePayload>,
+    #[serde(default)]
+    interconnects: Vec<ServerInterconnectPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerInterconnectPayload {
+    id: u64,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,6 +658,15 @@ async fn sync_server(
                 source: rule.source,
                 port_start: rule.port_start,
                 port_end: rule.port_end,
+            })
+            .collect(),
+        interconnects: payload
+            .server
+            .interconnects
+            .into_iter()
+            .map(|ic| ManagedServerInterconnect {
+                id: ic.id,
+                name: ic.name,
             })
             .collect(),
         container_id: None,
@@ -3261,6 +3279,7 @@ mod tests {
                 ip_alias: None,
             },
             firewall_rules: vec![],
+            interconnects: vec![],
             container_id: None,
             last_error: None,
             user: ManagedServerUser {

@@ -374,6 +374,9 @@ async fn boot_server(
     }
 
     let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    connect_interconnect_networks(registry, server, &container_id).await;
+
     set_runtime_state(
         registry,
         config,
@@ -1048,6 +1051,68 @@ async fn remove_container(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn interconnect_network_name(interconnect_id: u64) -> String {
+    format!("skyport-ic-{interconnect_id}")
+}
+
+async fn connect_interconnect_networks(
+    registry: &ServerRegistry,
+    server: &ManagedServerRecord,
+    container_id: &str,
+) {
+    if server.interconnects.is_empty() {
+        return;
+    }
+
+    let container_name = runtime_container_name(server.id);
+
+    for ic in &server.interconnects {
+        let network_name = interconnect_network_name(ic.id);
+
+        // Create the network if it doesn't exist (ignore errors if it already exists).
+        let _ = docker_command()
+            .args(["network", "create", "--driver", "bridge", &network_name])
+            .output()
+            .await;
+
+        // Connect the container to the network.
+        let result = docker_command()
+            .args(["network", "connect", &network_name, &container_name])
+            .output()
+            .await;
+
+        match result {
+            Ok(output) if output.status.success() => {
+                let _ = registry.append_console_message(
+                    server.id,
+                    "system",
+                    &format!("Connected to private network '{}'", ic.name),
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if !stderr.contains("already exists") {
+                    warn!(
+                        server_id = server.id,
+                        network = %ic.name,
+                        container = %container_id,
+                        error = %stderr,
+                        "failed to connect container to interconnect network"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    server_id = server.id,
+                    network = %ic.name,
+                    error = %error,
+                    "failed to run docker network connect"
+                );
+            }
+        }
+    }
+}
+
 fn runtime_container_name(server_id: u64) -> String {
     format!("skyport-server-{server_id}")
 }
@@ -1282,6 +1347,7 @@ mod tests {
                 ip_alias: None,
             },
             firewall_rules: vec![],
+            interconnects: vec![],
             container_id: None,
             last_error: None,
             user: crate::server_registry::ManagedServerUser {
