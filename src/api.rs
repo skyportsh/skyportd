@@ -1359,10 +1359,17 @@ async fn notify_backup_status(
         .as_deref()
         .context("missing daemon secret")?;
 
+    let daemon_uuid = config
+        .daemon
+        .uuid
+        .as_str();
+
     reqwest::Client::new()
         .post(format!("{panel_url}/api/daemon/servers/{server_id}/runtime"))
         .bearer_auth(daemon_secret)
         .json(&serde_json::json!({
+            "uuid": daemon_uuid,
+            "version": env!("CARGO_PKG_VERSION"),
             "status": null,
             "backup_id": backup_id,
             "backup_status": status,
