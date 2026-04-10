@@ -1051,6 +1051,21 @@ async fn remove_container(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn slugify_server_name(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+
+    let trimmed = slug.trim_matches('-').to_string();
+
+    if trimmed.is_empty() {
+        "server".to_string()
+    } else {
+        trimmed
+    }
+}
+
 fn interconnect_network_name(interconnect_id: u64) -> String {
     format!("skyport-ic-{interconnect_id}")
 }
@@ -1075,9 +1090,10 @@ async fn connect_interconnect_networks(
             .output()
             .await;
 
-        // Connect the container to the network.
+        // Connect the container to the network with a human-friendly alias.
+        let alias = slugify_server_name(&server.name);
         let result = docker_command()
-            .args(["network", "connect", &network_name, &container_name])
+            .args(["network", "connect", "--alias", &alias, &network_name, &container_name])
             .output()
             .await;
 
@@ -1086,7 +1102,10 @@ async fn connect_interconnect_networks(
                 let _ = registry.append_console_message(
                     server.id,
                     "system",
-                    &format!("Connected to private network '{}'", ic.name),
+                    &format!(
+                        "Connected to private network '{}' (reachable as '{}')",
+                        ic.name, alias
+                    ),
                 );
             }
             Ok(output) => {
