@@ -258,8 +258,8 @@ fn check_trigger(
 fn check_condition(
     condition: &ManagedServerWorkflowStep,
     server: &ManagedServerRecord,
-    state: &WorkflowState,
-    now: u64,
+    _state: &WorkflowState,
+    _now: u64,
 ) -> Result<bool> {
     match condition.kind.as_str() {
         "server_online" => Ok(server.status == "running"),

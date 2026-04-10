@@ -4,18 +4,15 @@ use anyhow::{Context, Result, bail};
 use axum::extract::ws::{Message, WebSocket};
 use ring::hmac;
 use serde_json::{Value, json};
-use tokio::select;
 use tokio::time::{self, MissedTickBehavior};
-use tracing::warn;
 
 use crate::server_registry::{ConsoleMessageRecord, ManagedServerRecord, ServerRegistry};
 use super::{
     ApiErrorResponse, ApiState, PowerSignal, WsAuthorizationQuery, WsClientEvent, WsTokenPayload,
-    apply_power_signal, container_is_running, current_resource_snapshot, ensure_compatible_request,
-    error_response, load_managed_server, send_command_to_server,
+    apply_power_signal, current_resource_snapshot, ensure_compatible_request,
+    load_managed_server, send_command_to_server,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::extract::ws::WebSocketUpgrade;
 use http::StatusCode;

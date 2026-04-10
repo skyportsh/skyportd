@@ -6,17 +6,13 @@ use filesystem::*;
 use backups::*;
 use websocket::*;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as StdPath, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -24,20 +20,19 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
-use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::{self, MissedTickBehavior};
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, project_root, safe_join_relative};
+use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, project_root};
 use crate::configuration;
 use crate::server_registry::{
-    ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule,
+    ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule,
     ManagedServerInterconnect, ManagedServerLimits, ManagedServerWorkflow, ManagedServerWorkflowStep,
     ManagedServerRecord, ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
@@ -219,7 +214,7 @@ struct WsTokenPayload {
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PowerSignal {
+pub(super) enum PowerSignal {
     Start,
     Stop,
     Restart,
@@ -335,7 +330,7 @@ struct ApiSuccessResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiErrorResponse {
+pub(super) struct ApiErrorResponse {
     message: String,
 }
 
@@ -1170,7 +1165,7 @@ async fn handle_transfer(
     authorize_request(&config, &headers)?;
     ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
 
-    let server = state
+    let _server = state
         .server_registry
         .get_server(server_id)
         .map_err(internal_error)?

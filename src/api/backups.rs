@@ -1,14 +1,10 @@
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
-use serde_json::json;
 use tracing::{info, warn};
 
 use crate::config::{project_root, managed_server_volume_path, DaemonConfig};
-use crate::server_registry::ServerRegistry;
 use super::{
     ApiErrorResponse, ApiState, ApiSuccessResponse, WsAuthorizationQuery,
     authorize_request, ensure_compatible_request, error_response, internal_error,
@@ -221,10 +217,10 @@ pub(super) async fn handle_backup(
 }
 
 pub(super) async fn download_backup(
-    Path((server_id, backup_uuid)): Path<(u64, String)>,
+    Path((_server_id, backup_uuid)): Path<(u64, String)>,
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<WsAuthorizationQuery>,
+    Query(_query): Query<WsAuthorizationQuery>,
 ) -> std::result::Result<axum::response::Response, (StatusCode, Json<ApiErrorResponse>)> {
     use axum::body::Body;
     use axum::response::IntoResponse;
@@ -247,7 +243,7 @@ pub(super) async fn download_backup(
         .await
         .map_err(|e| internal_error(anyhow::anyhow!("failed to open backup: {e}")))?;
 
-    let size = file
+    let _size = file
         .metadata()
         .await
         .map(|m| m.len())

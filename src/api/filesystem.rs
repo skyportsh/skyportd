@@ -1,13 +1,12 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as StdPath, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{managed_server_volume_path, safe_join_relative};
+use crate::config::safe_join_relative;
 use crate::server_registry::ManagedServerRecord;
 use super::{DirectoryListingPayload, FileContentsPayload, FilesystemEntryPayload, resolve_volume_path};
 
