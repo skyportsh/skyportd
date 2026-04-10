@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, safe_join_relative};
 use crate::configuration;
 use crate::server_registry::{
-    ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerLimits,
+    ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule, ManagedServerLimits,
     ManagedServerRecord, ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
 
@@ -232,6 +232,19 @@ struct ServerPayload {
     user: ServerUserPayload,
     limits: ServerLimitsPayload,
     cargo: ServerCargoPayload,
+    #[serde(default)]
+    firewall_rules: Vec<ServerFirewallRulePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerFirewallRulePayload {
+    id: u64,
+    direction: String,
+    action: String,
+    protocol: String,
+    source: String,
+    port_start: Option<u64>,
+    port_end: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -624,6 +637,20 @@ async fn sync_server(
             port: payload.server.allocation.port,
             ip_alias: payload.server.allocation.ip_alias,
         },
+        firewall_rules: payload
+            .server
+            .firewall_rules
+            .into_iter()
+            .map(|rule| ManagedServerFirewallRule {
+                id: rule.id,
+                direction: rule.direction,
+                action: rule.action,
+                protocol: rule.protocol,
+                source: rule.source,
+                port_start: rule.port_start,
+                port_end: rule.port_end,
+            })
+            .collect(),
         container_id: None,
         last_error: None,
         user: ManagedServerUser {
@@ -3233,6 +3260,7 @@ mod tests {
                 port: 25565,
                 ip_alias: None,
             },
+            firewall_rules: vec![],
             container_id: None,
             last_error: None,
             user: ManagedServerUser {

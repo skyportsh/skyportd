@@ -1281,6 +1281,7 @@ mod tests {
                 port: 25565,
                 ip_alias: None,
             },
+            firewall_rules: vec![],
             container_id: None,
             last_error: None,
             user: crate::server_registry::ManagedServerUser {
