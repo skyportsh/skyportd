@@ -346,6 +346,10 @@ async fn boot_server(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let volume_path = resolve_volume_path(config, server)?;
+    tokio::fs::create_dir_all(&volume_path)
+        .await
+        .with_context(|| format!("failed to create {}", volume_path.display()))?;
+    fix_volume_permissions(&volume_path).await;
     ensure_server_boot_prerequisites(server, &volume_path)?;
     registry.append_console_message(server.id, "system", "Checking disk space limits...")?;
     ensure_disk_limit(&volume_path, server.limits.disk_mib)?;
@@ -1078,6 +1082,30 @@ async fn remove_container(name: &str) -> Result<()> {
         .await;
 
     Ok(())
+}
+
+async fn fix_volume_permissions(volume_path: &Path) {
+    // On Linux, ensure the volume directory is owned by a standard container
+    // user (UID 1000) and has correct permissions so the container process
+    // can read/write files. On macOS this is a no-op since Docker Desktop
+    // handles file sharing differently.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+
+    let path = volume_path.to_string_lossy().to_string();
+
+    // Set ownership to UID/GID 1000 (standard container user)
+    let _ = tokio::process::Command::new("chown")
+        .args(["-R", "1000:1000", &path])
+        .output()
+        .await;
+
+    // Ensure the directory itself is accessible
+    let _ = tokio::process::Command::new("chmod")
+        .args(["755", &path])
+        .output()
+        .await;
 }
 
 fn slugify_server_name(name: &str) -> String {
