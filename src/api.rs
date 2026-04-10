@@ -496,6 +496,7 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
             get(download_install_log),
         )
         .route("/api/daemon/servers/{server_id}/ws", get(server_ws))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1100)) // 1.1 GB (backup uploads + overhead)
         .with_state(state);
     let server_handle = handle.clone();
     let server_spec = spec.clone();
