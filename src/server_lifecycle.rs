@@ -45,6 +45,13 @@ impl ServerLifecycleService {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let active = Arc::new(Mutex::new(HashSet::<u64>::new()));
 
+        // Track servers we've booted this daemon session. Running containers
+        // found at startup that we didn't boot need to be recreated so we
+        // get a fresh stdin pipe (the old one died with the previous daemon).
+        let booted_this_session: Arc<Mutex<HashSet<u64>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+
+
         info!("server lifecycle service started");
 
         loop {
@@ -74,6 +81,7 @@ impl ServerLifecycleService {
 
                         let registry = self.server_registry.clone();
                         let active = Arc::clone(&active);
+                        let booted = Arc::clone(&booted_this_session);
                         let cancellation = self.cancellation.child_token();
                         let config = config.clone();
                         let failure_status =
@@ -82,7 +90,7 @@ impl ServerLifecycleService {
 
                         tokio::spawn(async move {
                             let server_id = server.id;
-                            if let Err(error) = reconcile_server(registry.clone(), server, config.clone(), cancellation).await {
+                            if let Err(error) = reconcile_server(registry.clone(), server, config.clone(), cancellation, &booted).await {
                                 warn!(server_id, error = %error, "server reconciliation failed");
                                 let _ = set_runtime_state(
                                     &registry,
@@ -136,6 +144,7 @@ async fn reconcile_server(
     mut server: ManagedServerRecord,
     config: DaemonConfig,
     cancellation: CancellationToken,
+    booted_this_session: &Mutex<HashSet<u64>>,
 ) -> Result<()> {
     if cancellation.is_cancelled() {
         return Ok(());
@@ -146,8 +155,26 @@ async fn reconcile_server(
             provision_and_install(&registry, &mut server, &config, &cancellation).await?;
         }
         "starting" | "running" => {
-            if !runtime_container_is_running(&server).await? {
+            let container_running = runtime_container_is_running(&server).await?;
+            let already_booted = booted_this_session.lock().await.contains(&server.id);
+
+            if container_running && !already_booted {
+                // Container survived a daemon restart but its stdin pipe is
+                // dead. Recreate it to get a fresh pipe.
+                info!(
+                    server_id = server.id,
+                    "restarting server to restore console input after daemon restart"
+                );
+                registry.append_console_message(
+                    server.id,
+                    "system",
+                    "Restarting server to restore console input after daemon restart.",
+                )?;
                 boot_server(&registry, &mut server, &config, &cancellation).await?;
+                booted_this_session.lock().await.insert(server.id);
+            } else if !container_running {
+                boot_server(&registry, &mut server, &config, &cancellation).await?;
+                booted_this_session.lock().await.insert(server.id);
             }
         }
         "stopping" => {
@@ -159,10 +186,12 @@ async fn reconcile_server(
             if !runtime_container_is_running(&server).await? {
                 server.status = "offline".to_string();
                 boot_server(&registry, &mut server, &config, &cancellation).await?;
+                booted_this_session.lock().await.insert(server.id);
             }
         }
         _ => {
             provision_and_install(&registry, &mut server, &config, &cancellation).await?;
+            booted_this_session.lock().await.insert(server.id);
         }
     }
 
