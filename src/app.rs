@@ -11,6 +11,7 @@ use crate::config::DaemonConfig;
 use crate::server_lifecycle::ServerLifecycleService;
 use crate::server_registry::ServerRegistry;
 use crate::service::HeartbeatService;
+use crate::sftp::SftpService;
 use crate::shutdown;
 
 const ORANGE: &str = "\x1b[38;2;240;90;36m";
@@ -74,6 +75,15 @@ impl DaemonApp {
             );
 
             async move { service.run().await.context("api service stopped") }
+        });
+
+        tracker.spawn({
+            let service = SftpService::new(
+                config_rx.clone(),
+                cancellation.child_token(),
+            );
+
+            async move { service.run().await.context("sftp service stopped") }
         });
 
         tracker.spawn({
