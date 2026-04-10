@@ -470,6 +470,7 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
         )
         .route("/api/daemon/servers/{server_id}/power", post(power_server))
         .route("/api/daemon/servers/{server_id}/backups", post(handle_backup))
+        .route("/api/daemon/servers/{server_id}/backups/{backup_uuid}/download", get(download_backup))
         .route(
             "/api/daemon/servers/{server_id}/install-log",
             get(download_install_log),
@@ -1329,6 +1330,55 @@ async fn handle_backup(
     }
 
     Ok(Json(ApiSuccessResponse { ok: true }))
+}
+
+async fn download_backup(
+    Path((server_id, backup_uuid)): Path<(u64, String)>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<WsAuthorizationQuery>,
+) -> std::result::Result<axum::response::Response, (StatusCode, Json<ApiErrorResponse>)> {
+    use axum::body::Body;
+    use axum::response::IntoResponse;
+    use tokio_util::io::ReaderStream;
+
+    let config = state.config_rx.borrow().clone();
+    authorize_request(&config, &headers)?;
+
+    let backups_dir = project_root().map_err(internal_error)?.join("backups");
+    let backup_path = backups_dir.join(format!("{backup_uuid}.tar.gz"));
+
+    if !backup_path.exists() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Backup file not found.".to_string(),
+        ));
+    }
+
+    let file = tokio::fs::File::open(&backup_path)
+        .await
+        .map_err(|e| internal_error(anyhow::anyhow!("failed to open backup: {e}")))?;
+
+    let size = file
+        .metadata()
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok((
+        [
+            (http::header::CONTENT_TYPE, "application/gzip"),
+            (
+                http::header::CONTENT_DISPOSITION,
+                &format!("attachment; filename=\"{backup_uuid}.tar.gz\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 fn format_backup_size(bytes: u64) -> String {
@@ -2742,8 +2792,8 @@ fn upload_file(
     name: &str,
     bytes: &[u8],
 ) -> Result<()> {
-    if bytes.len() > 100 * 1024 * 1024 {
-        bail!("Uploaded files may not be larger than 100 MB.");
+    if bytes.len() > 1024 * 1024 * 1024 {
+        bail!("Uploaded files may not be larger than 1 GB.");
     }
 
     let volume_path = ensure_server_volume(server)?;

@@ -4,3 +4,4 @@ Cargo.lock
 config/local.toml
 volumes/
 skyportd.db
+backups/
