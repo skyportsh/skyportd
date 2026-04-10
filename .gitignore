@@ -5,3 +5,5 @@ config/local.toml
 volumes/
 skyportd.db
 backups/
+target-check
+.ari
