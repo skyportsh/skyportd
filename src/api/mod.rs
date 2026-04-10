@@ -498,6 +498,7 @@ fn start_server(spec: ListenerSpec, state: ApiState) -> Result<RunningServer> {
         )
         .route("/api/daemon/servers/{server_id}/power", post(power_server))
         .route("/api/daemon/servers/{server_id}/backups", post(handle_backup))
+        .route("/api/daemon/servers/{server_id}/transfer", post(handle_transfer))
         .route("/api/daemon/servers/{server_id}/backups/{backup_uuid}/download", get(download_backup))
         .route(
             "/api/daemon/servers/{server_id}/install-log",
@@ -1149,6 +1150,146 @@ async fn upload_server_file(
         message: "File uploaded successfully.".to_string(),
         ok: true,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TransferRequest {
+    action: String,
+    transfer_id: u64,
+    panel_version: String,
+    uuid: String,
+}
+
+async fn handle_transfer(
+    Path(server_id): Path<u64>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<TransferRequest>,
+) -> std::result::Result<Json<ApiSuccessResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    let config = state.config_rx.borrow().clone();
+    authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+
+    let server = state
+        .server_registry
+        .get_server(server_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Server not found.".to_string()))?;
+
+    match payload.action.as_str() {
+        "archive" => {
+            info!(server_id, transfer_id = payload.transfer_id, "starting transfer archive");
+
+            let _ = state.server_registry.append_console_message(
+                server_id,
+                "system",
+                "Transfer started. Archiving server files...",
+            );
+
+            let registry = state.server_registry.clone();
+            let transfer_id = payload.transfer_id;
+            let config = config.clone();
+            let volume_path = managed_server_volume_path(server_id).map_err(internal_error)?;
+            let backups_dir = project_root().map_err(internal_error)?.join("transfers");
+
+            tokio::spawn(async move {
+                let _ = std::fs::create_dir_all(&backups_dir);
+                let archive_path = backups_dir.join(format!("transfer-{transfer_id}.tar.gz"));
+
+                // Archive the server volume.
+                let output = tokio::process::Command::new("tar")
+                    .arg("czf")
+                    .arg(&archive_path)
+                    .arg("-C")
+                    .arg(&volume_path)
+                    .arg(".")
+                    .output()
+                    .await;
+
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let size = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+
+                        let _ = registry.append_console_message(
+                            server_id,
+                            "system",
+                            &format!("Archive complete ({} bytes). Ready for transfer.", size),
+                        );
+
+                        let _ = notify_transfer_status(
+                            &config, server_id, transfer_id, "transferring", 50, size, None,
+                        ).await;
+                    }
+                    _ => {
+                        let _ = registry.append_console_message(
+                            server_id,
+                            "system",
+                            "Transfer archive failed.",
+                        );
+
+                        let _ = notify_transfer_status(
+                            &config, server_id, transfer_id, "failed", 0, 0,
+                            Some("Failed to create transfer archive."),
+                        ).await;
+                    }
+                }
+            });
+        }
+        "cancel" => {
+            info!(server_id, transfer_id = payload.transfer_id, "transfer cancelled");
+
+            // Clean up the archive if it exists.
+            let transfers_dir = project_root().map_err(internal_error)?.join("transfers");
+            let archive_path = transfers_dir.join(format!("transfer-{}.tar.gz", payload.transfer_id));
+            let _ = std::fs::remove_file(&archive_path);
+
+            let _ = state.server_registry.append_console_message(
+                server_id,
+                "system",
+                "Transfer has been cancelled.",
+            );
+        }
+        _ => {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Unknown transfer action: {}", payload.action),
+            ));
+        }
+    }
+
+    Ok(Json(ApiSuccessResponse { ok: true }))
+}
+
+async fn notify_transfer_status(
+    config: &DaemonConfig,
+    server_id: u64,
+    transfer_id: u64,
+    status: &str,
+    progress: u8,
+    archive_size: u64,
+    error: Option<&str>,
+) -> Result<()> {
+    let panel_url = config.panel.url.trim_end_matches('/');
+    let daemon_secret = config.panel.daemon_secret.as_deref().context("missing daemon secret")?;
+
+    reqwest::Client::new()
+        .post(format!("{panel_url}/api/daemon/servers/{server_id}/runtime"))
+        .bearer_auth(daemon_secret)
+        .json(&serde_json::json!({
+            "uuid": config.daemon.uuid,
+            "version": env!("CARGO_PKG_VERSION"),
+            "status": null,
+            "transfer_id": transfer_id,
+            "transfer_status": status,
+            "transfer_progress": progress,
+            "transfer_archive_size": archive_size,
+            "transfer_error": error,
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    Ok(())
 }
 
 async fn power_server(
