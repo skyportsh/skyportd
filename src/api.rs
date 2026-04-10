@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as StdPath, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2174,7 +2175,7 @@ fn read_text_file(
         contents,
         last_modified_at: modified_at(&metadata),
         path: normalized_path,
-        permissions: Some(format_permissions(metadata.permissions().mode())),
+        permissions: get_permissions_string(&metadata.permissions()),
         size_bytes: metadata.len(),
     })
 }
@@ -2349,16 +2350,25 @@ fn update_file_permissions(
         }
 
         let target_path = resolve_existing_server_path(&volume_path, &normalized_path)?;
-        let mut target_permissions = fs::metadata(&target_path)
-            .with_context(|| format!("failed to read metadata for {}", target_path.display()))?
-            .permissions();
-        target_permissions.set_mode(mode);
-        fs::set_permissions(&target_path, target_permissions).with_context(|| {
-            format!("failed to update permissions for {}", target_path.display())
-        })?;
+        set_file_mode(&target_path, mode)?;
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &StdPath, mode: u32) -> Result<()> {
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?
+        .permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to update permissions for {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_path: &StdPath, _mode: u32) -> Result<()> {
+    bail!("File permission changes are not supported on Windows")
 }
 
 fn create_archive(
@@ -2802,7 +2812,7 @@ fn filesystem_entry_payload(
         last_modified_at: modified_at(&metadata),
         name,
         path: relative_path,
-        permissions: Some(format_permissions(metadata.permissions().mode())),
+        permissions: get_permissions_string(&metadata.permissions()),
         size_bytes: if metadata.is_file() {
             Some(metadata.len())
         } else {
@@ -2926,8 +2936,19 @@ fn modified_at(metadata: &fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+#[cfg(unix)]
 fn format_permissions(mode: u32) -> String {
     format!("{:03o}", mode & 0o777)
+}
+
+#[cfg(unix)]
+fn get_permissions_string(permissions: &std::fs::Permissions) -> Option<String> {
+    Some(format_permissions(permissions.mode()))
+}
+
+#[cfg(not(unix))]
+fn get_permissions_string(_permissions: &std::fs::Permissions) -> Option<String> {
+    None
 }
 
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ApiErrorResponse>) {
@@ -2944,8 +2965,6 @@ fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ApiE
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
-
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -3159,8 +3178,11 @@ mod tests {
         assert!(!source.contains(&removed_stop_message));
     }
 
+    #[cfg(unix)]
     #[test]
     fn existing_filesystem_paths_reject_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
         let tempdir = tempdir().unwrap();
         let volume = tempdir.path().join("volume");
         let outside = tempdir.path().join("outside");
@@ -3175,8 +3197,11 @@ mod tests {
         assert!(error.contains("within the server volume"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_paths_reject_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
         let tempdir = tempdir().unwrap();
         let volume = tempdir.path().join("volume");
         let outside = tempdir.path().join("outside.txt");
