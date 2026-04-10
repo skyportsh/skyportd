@@ -1750,15 +1750,31 @@ async fn send_command_to_server(
         bail!("The server is not running.");
     }
 
-    let output = docker_command()
+    // Use `docker exec -i` and pipe the command through stdin so it reaches
+    // PID 1's fd/0 reliably. The previous approach used a shell script that
+    // wrote to /proc/pid/fd/0 directly, but this breaks after a daemon
+    // reboot because the original stdin pipe from `docker run -i` is dead.
+    let mut child = docker_command()
         .arg("exec")
-        .arg("-e")
-        .arg(format!("SKYPORT_SERVER_COMMAND={command}"))
+        .arg("-i")
         .arg(runtime_container_name(server.id))
         .arg("sh")
-        .arg("-lc")
-        .arg(runtime_command_forward_script())
-        .output()
+        .arg("-c")
+        .arg("cat > /proc/1/fd/0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to exec into the runtime container")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(format!("{command}\n").as_bytes()).await;
+        drop(stdin);
+    }
+
+    let output = child
+        .wait_with_output()
         .await
         .context("failed to forward command to the runtime container")?;
 
@@ -1773,25 +1789,6 @@ async fn send_command_to_server(
     }
 
     Ok(())
-}
-
-fn runtime_command_forward_script() -> &'static str {
-    r#"pid=1
-while :; do
-    child=""
-    for stat in /proc/[0-9]*/stat; do
-        set -- $(cat "$stat" 2>/dev/null) || continue
-        if [ "$4" = "$pid" ]; then
-            child="$1"
-            break
-        fi
-    done
-
-    [ -n "$child" ] || break
-    pid="$child"
-done
-
-printf '%s\n' "$SKYPORT_SERVER_COMMAND" > "/proc/$pid/fd/0""#
 }
 
 async fn graceful_stop(
@@ -3046,17 +3043,6 @@ mod tests {
 
         assert_eq!(event.event, "set state");
         assert_eq!(event.args, vec!["restart"]);
-    }
-
-    #[test]
-    fn command_forward_script_targets_the_leaf_process_stdin() {
-        let script = runtime_command_forward_script();
-
-        assert!(script.contains("pid=1"));
-        assert!(script.contains("for stat in /proc/[0-9]*/stat"));
-        assert!(
-            script.contains("printf '%s\\n' \"$SKYPORT_SERVER_COMMAND\" > \"/proc/$pid/fd/0\"")
-        );
     }
 
     #[test]
