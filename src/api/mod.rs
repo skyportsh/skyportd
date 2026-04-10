@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
 use std::time::Duration;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use axum::body::Bytes;
@@ -20,6 +22,8 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
+#[cfg(test)]
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -31,6 +35,8 @@ use tracing::{info, warn};
 
 use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, project_root};
 use crate::configuration;
+#[cfg(test)]
+use crate::server_registry::ConsoleMessageRecord;
 use crate::server_registry::{
     ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule,
     ManagedServerInterconnect, ManagedServerLimits, ManagedServerWorkflow, ManagedServerWorkflowStep,
