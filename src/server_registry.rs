@@ -27,6 +27,7 @@ pub struct ManagedServerRecord {
     pub allocation: ManagedServerAllocation,
     pub interconnects: Vec<ManagedServerInterconnect>,
     pub firewall_rules: Vec<ManagedServerFirewallRule>,
+    pub workflows: Vec<ManagedServerWorkflow>,
     pub container_id: Option<String>,
     pub last_error: Option<String>,
     pub user: ManagedServerUser,
@@ -46,6 +47,23 @@ pub struct ManagedServerLimits {
     pub memory_mib: u64,
     pub cpu_limit: u64,
     pub disk_mib: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedServerWorkflow {
+    pub id: u64,
+    pub name: String,
+    pub nodes: Vec<ManagedServerWorkflowStep>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedServerWorkflowStep {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub step_type: String,
+    pub kind: String,
+    #[serde(default)]
+    pub config: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +193,7 @@ impl ServerRegistry {
                 allocation_json TEXT NOT NULL DEFAULT '{}',
                 firewall_rules_json TEXT NOT NULL DEFAULT '[]',
                 interconnects_json TEXT NOT NULL DEFAULT '[]',
+                workflows_json TEXT NOT NULL DEFAULT '[]',
                 container_id TEXT,
                 last_error TEXT
             );
@@ -220,7 +239,7 @@ impl ServerRegistry {
                 startup_command, config_files, config_startup, config_logs, config_stop,
                 install_script, install_container, install_entrypoint,
                 features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-                variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, container_id, last_error
+                variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, workflows_json, container_id, last_error
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8,
@@ -230,7 +249,7 @@ impl ServerRegistry {
                 ?19, ?20, ?21, ?22, ?23,
                 ?24, ?25, ?26,
                 ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
             )
             ON CONFLICT(id) DO UPDATE SET
                 node_id = excluded.node_id,
@@ -267,6 +286,7 @@ impl ServerRegistry {
                 allocation_json = excluded.allocation_json,
                 firewall_rules_json = excluded.firewall_rules_json,
                 interconnects_json = excluded.interconnects_json,
+                workflows_json = excluded.workflows_json,
                 container_id = excluded.container_id,
                 last_error = excluded.last_error
             "#,
@@ -306,6 +326,7 @@ impl ServerRegistry {
                 serde_json::to_string(&server.allocation)?,
                 serde_json::to_string(&server.firewall_rules)?,
                 serde_json::to_string(&server.interconnects)?,
+                serde_json::to_string(&server.workflows)?,
                 container_id,
                 last_error,
             ],
@@ -510,6 +531,16 @@ impl ServerRegistry {
             )?;
         }
 
+        if !existing_columns
+            .iter()
+            .any(|column| column == "workflows_json")
+        {
+            connection.execute(
+                "ALTER TABLE servers ADD COLUMN workflows_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -564,7 +595,7 @@ SELECT
     startup_command, config_files, config_startup, config_logs, config_stop,
     install_script, install_container, install_entrypoint,
     features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-    variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, container_id, last_error
+    variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, workflows_json, container_id, last_error
 FROM servers
 "#;
 
@@ -581,8 +612,9 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
         allocation: parse_json(row.get::<_, String>(32)?)?,
         firewall_rules: parse_json(row.get::<_, String>(33)?)?,
         interconnects: parse_json(row.get::<_, String>(34)?)?,
-        container_id: row.get(35)?,
-        last_error: row.get(36)?,
+        workflows: parse_json(row.get::<_, String>(35)?)?,
+        container_id: row.get(36)?,
+        last_error: row.get(37)?,
         user: ManagedServerUser {
             id: row.get(8)?,
             name: row.get(9)?,
@@ -701,6 +733,7 @@ mod tests {
             },
             firewall_rules: vec![],
             interconnects: vec![],
+            workflows: vec![],
         };
 
         registry.upsert_server(&server).unwrap();

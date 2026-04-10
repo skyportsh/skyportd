@@ -7,6 +7,7 @@ mod server_lifecycle;
 mod server_registry;
 mod service;
 mod sftp;
+mod workflow;
 mod shutdown;
 
 use anyhow::Result;

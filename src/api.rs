@@ -30,7 +30,7 @@ use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, proje
 use crate::configuration;
 use crate::server_registry::{
     ConsoleMessageRecord, ManagedServerAllocation, ManagedServerCargo, ManagedServerFirewallRule,
-    ManagedServerInterconnect, ManagedServerLimits,
+    ManagedServerInterconnect, ManagedServerLimits, ManagedServerWorkflow, ManagedServerWorkflowStep,
     ManagedServerRecord, ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
 
@@ -238,6 +238,26 @@ struct ServerPayload {
     firewall_rules: Vec<ServerFirewallRulePayload>,
     #[serde(default)]
     interconnects: Vec<ServerInterconnectPayload>,
+    #[serde(default)]
+    workflows: Vec<ServerWorkflowPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerWorkflowPayload {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    nodes: Vec<ServerWorkflowStepPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerWorkflowStepPayload {
+    id: String,
+    #[serde(rename = "type")]
+    step_type: String,
+    kind: String,
+    #[serde(default)]
+    config: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -670,6 +690,25 @@ async fn sync_server(
             .map(|ic| ManagedServerInterconnect {
                 id: ic.id,
                 name: ic.name,
+            })
+            .collect(),
+        workflows: payload
+            .server
+            .workflows
+            .into_iter()
+            .map(|w| ManagedServerWorkflow {
+                id: w.id,
+                name: w.name,
+                nodes: w
+                    .nodes
+                    .into_iter()
+                    .map(|n| ManagedServerWorkflowStep {
+                        id: n.id,
+                        step_type: n.step_type,
+                        kind: n.kind,
+                        config: n.config,
+                    })
+                    .collect(),
             })
             .collect(),
         container_id: None,
@@ -2050,7 +2089,7 @@ async fn apply_power_signal(
     Ok(())
 }
 
-async fn send_command_to_server(
+pub async fn send_command_to_server(
     _registry: &ServerRegistry,
     server: &ManagedServerRecord,
     command: &str,
@@ -2328,7 +2367,7 @@ fn authorize_request(
     Ok(())
 }
 
-async fn container_is_running(server_id: u64) -> Result<bool> {
+pub async fn container_is_running(server_id: u64) -> Result<bool> {
     let output = docker_command()
         .arg("inspect")
         .arg("-f")
@@ -2363,7 +2402,7 @@ async fn remove_container(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn runtime_container_name(server_id: u64) -> String {
+pub fn runtime_container_name(server_id: u64) -> String {
     format!("skyport-server-{server_id}")
 }
 
@@ -2371,7 +2410,7 @@ fn install_container_name(server_id: u64) -> String {
     format!("skyport-install-{server_id}")
 }
 
-fn docker_command() -> Command {
+pub fn docker_command() -> Command {
     let mut command = Command::new("docker");
     command.kill_on_drop(true);
     command
@@ -3600,6 +3639,7 @@ mod tests {
             },
             firewall_rules: vec![],
             interconnects: vec![],
+            workflows: vec![],
             container_id: None,
             last_error: None,
             user: ManagedServerUser {

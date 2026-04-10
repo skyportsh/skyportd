@@ -13,6 +13,7 @@ use crate::server_registry::ServerRegistry;
 use crate::service::HeartbeatService;
 use crate::sftp::SftpService;
 use crate::shutdown;
+use crate::workflow::WorkflowService;
 
 const ORANGE: &str = "\x1b[38;2;240;90;36m";
 const GRAY: &str = "\x1b[38;2;120;120;120m";
@@ -84,6 +85,16 @@ impl DaemonApp {
             );
 
             async move { service.run().await.context("sftp service stopped") }
+        });
+
+        tracker.spawn({
+            let service = WorkflowService::new(
+                config_rx.clone(),
+                server_registry.clone(),
+                cancellation.child_token(),
+            );
+
+            async move { service.run().await.context("workflow engine stopped") }
         });
 
         tracker.spawn({

@@ -1424,6 +1424,7 @@ mod tests {
             },
             firewall_rules: vec![],
             interconnects: vec![],
+            workflows: vec![],
             container_id: None,
             last_error: None,
             user: crate::server_registry::ManagedServerUser {
