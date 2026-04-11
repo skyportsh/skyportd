@@ -1,14 +1,17 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as StdPath, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
+use super::{
+    resolve_volume_path, DirectoryListingPayload, FileContentsPayload, FilesystemEntryPayload,
+};
 use crate::config::safe_join_relative;
 use crate::server_registry::ManagedServerRecord;
-use super::{DirectoryListingPayload, FileContentsPayload, FilesystemEntryPayload, resolve_volume_path};
 
 pub(super) fn list_directory(
     server: &ManagedServerRecord,
@@ -112,7 +115,11 @@ pub(super) fn write_text_file(
     Ok(())
 }
 
-pub(super) fn create_file(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
+pub(super) fn create_file(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+    name: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let directory_path =
         resolve_existing_server_path(&volume_path, &normalize_relative_path(requested_path)?)?;
@@ -132,7 +139,11 @@ pub(super) fn create_file(server: &ManagedServerRecord, requested_path: &str, na
     Ok(())
 }
 
-pub(super) fn create_directory(server: &ManagedServerRecord, requested_path: &str, name: &str) -> Result<()> {
+pub(super) fn create_directory(
+    server: &ManagedServerRecord,
+    requested_path: &str,
+    name: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let directory_path =
         resolve_existing_server_path(&volume_path, &normalize_relative_path(requested_path)?)?;
@@ -212,7 +223,11 @@ pub(super) fn rename_filesystem_entry(
     Ok(())
 }
 
-pub(super) fn move_files(server: &ManagedServerRecord, paths: &[String], destination: &str) -> Result<()> {
+pub(super) fn move_files(
+    server: &ManagedServerRecord,
+    paths: &[String],
+    destination: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let destination_path = resolve_destination_directory(&volume_path, destination)?;
 
@@ -223,7 +238,11 @@ pub(super) fn move_files(server: &ManagedServerRecord, paths: &[String], destina
     Ok(())
 }
 
-pub(super) fn copy_files(server: &ManagedServerRecord, paths: &[String], destination: &str) -> Result<()> {
+pub(super) fn copy_files(
+    server: &ManagedServerRecord,
+    paths: &[String],
+    destination: &str,
+) -> Result<()> {
     let volume_path = ensure_server_volume(server)?;
     let destination_path = resolve_destination_directory(&volume_path, destination)?;
 
@@ -408,7 +427,10 @@ pub(super) fn upload_file(
     Ok(())
 }
 
-pub(super) fn resolve_destination_directory(volume_path: &PathBuf, destination: &str) -> Result<PathBuf> {
+pub(super) fn resolve_destination_directory(
+    volume_path: &PathBuf,
+    destination: &str,
+) -> Result<PathBuf> {
     let destination_path =
         resolve_existing_server_path(volume_path, &normalize_relative_path(destination)?)?;
 
@@ -757,7 +779,10 @@ pub(super) fn normalize_relative_path(path: &str) -> Result<String> {
     Ok(segments.join("/"))
 }
 
-pub(super) fn resolve_existing_server_path(volume_path: &PathBuf, relative_path: &str) -> Result<PathBuf> {
+pub(super) fn resolve_existing_server_path(
+    volume_path: &PathBuf,
+    relative_path: &str,
+) -> Result<PathBuf> {
     if relative_path.is_empty() {
         return Ok(volume_path.clone());
     }
@@ -773,7 +798,10 @@ pub(super) fn resolve_existing_server_path(volume_path: &PathBuf, relative_path:
     Ok(resolved)
 }
 
-pub(super) fn resolve_server_path_for_write(volume_path: &PathBuf, relative_path: &str) -> Result<PathBuf> {
+pub(super) fn resolve_server_path_for_write(
+    volume_path: &PathBuf,
+    relative_path: &str,
+) -> Result<PathBuf> {
     let candidate = safe_join_relative(volume_path, relative_path)?;
 
     if candidate.exists() {
@@ -854,4 +882,3 @@ fn get_permissions_string(permissions: &std::fs::Permissions) -> Option<String> 
 fn get_permissions_string(_permissions: &std::fs::Permissions) -> Option<String> {
     None
 }
-

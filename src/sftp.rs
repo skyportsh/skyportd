@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -109,12 +110,44 @@ impl SftpSession {
         key
     }
 
+    #[cfg(unix)]
     fn metadata_to_attrs(metadata: &fs::Metadata) -> Vec<u8> {
         let flags: u32 = 0x01 | 0x02 | 0x04 | 0x08; // SIZE | UIDGID | PERMISSIONS | ACMODTIME
         let size = metadata.len();
         let uid = metadata.uid();
         let gid = metadata.gid();
         let perms = metadata.permissions().mode();
+        let atime = metadata
+            .accessed()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+
+        let mut buf = Vec::with_capacity(28);
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&size.to_be_bytes());
+        buf.extend_from_slice(&uid.to_be_bytes());
+        buf.extend_from_slice(&gid.to_be_bytes());
+        buf.extend_from_slice(&perms.to_be_bytes());
+        buf.extend_from_slice(&atime.to_be_bytes());
+        buf.extend_from_slice(&mtime.to_be_bytes());
+        buf
+    }
+
+    #[cfg(not(unix))]
+    fn metadata_to_attrs(metadata: &fs::Metadata) -> Vec<u8> {
+        let flags: u32 = 0x01 | 0x02 | 0x04 | 0x08; // SIZE | UIDGID | PERMISSIONS | ACMODTIME
+        let size = metadata.len();
+        let uid: u32 = 0;
+        let gid: u32 = 0;
+        let perms: u32 = if metadata.is_dir() { 0o755 } else if metadata.permissions().readonly() { 0o444 } else { 0o644 };
         let atime = metadata
             .accessed()
             .ok()
