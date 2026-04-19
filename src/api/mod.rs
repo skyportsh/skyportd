@@ -1464,12 +1464,14 @@ pub(super) async fn apply_power_signal(
         }
         PowerSignal::Stop => {
             if !container_is_running(server.id).await? {
-                registry.set_server_runtime(server.id, "offline", None, None)?;
-                registry.append_console_message(
-                    server.id,
-                    "system",
-                    "Stop requested, but the server was already offline.",
-                )?;
+                if server.status != "offline" {
+                    registry.set_server_runtime(server.id, "offline", None, None)?;
+                    registry.append_console_message(
+                        server.id,
+                        "system",
+                        "Stop requested, but the server was already offline.",
+                    )?;
+                }
             } else {
                 registry.set_server_runtime(server.id, "stopping", None, None)?;
                 registry.append_console_message(
@@ -1606,12 +1608,14 @@ async fn graceful_stop(
     final_status: &str,
 ) -> Result<()> {
     if !container_is_running(server.id).await? {
-        registry.set_server_runtime(server.id, "offline", None, None)?;
-        registry.append_console_message(
-            server.id,
-            "system",
-            "Stop requested, but the server was already offline.",
-        )?;
+        if server.status != "offline" {
+            registry.set_server_runtime(server.id, "offline", None, None)?;
+            registry.append_console_message(
+                server.id,
+                "system",
+                "Stop requested, but the server was already offline.",
+            )?;
+        }
         return Ok(());
     }
 
@@ -1684,12 +1688,16 @@ fn stop_completion_message(final_status: &str) -> &'static str {
 
 async fn kill_server(registry: &ServerRegistry, server: &ManagedServerRecord) -> Result<()> {
     if !container_is_running(server.id).await? {
-        registry.set_server_runtime(server.id, "offline", None, None)?;
-        registry.append_console_message(
-            server.id,
-            "system",
-            "Kill requested, but the server was already offline.",
-        )?;
+        // Only set offline if not already offline to avoid spamming console
+        // when the panel sends repeated kill signals.
+        if server.status != "offline" {
+            registry.set_server_runtime(server.id, "offline", None, None)?;
+            registry.append_console_message(
+                server.id,
+                "system",
+                "Kill requested, but the server was already offline.",
+            )?;
+        }
         return Ok(());
     }
 
