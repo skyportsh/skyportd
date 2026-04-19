@@ -379,6 +379,11 @@ async fn boot_server(
     apply_config_file_actions(registry, server, &volume_path).await?;
     remove_container(&runtime_container_name(server.id)).await?;
 
+    // Release the port if a stale container from a different server is
+    // still holding it. This can happen when a previous server was
+    // removed from the panel but its container wasn't cleaned up.
+    release_port_if_occupied(server.allocation.port).await;
+
     registry.append_console_message(
         server.id,
         "system",
@@ -395,6 +400,32 @@ async fn boot_server(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        // If the port is still occupied after cleanup, try once more.
+        if stderr.contains("port is already allocated") || stderr.contains("address already in use") {
+            registry.append_console_message(
+                server.id,
+                "system",
+                "Port conflict detected. Cleaning up stale containers and retrying...",
+            )?;
+            release_port_if_occupied(server.allocation.port).await;
+            time::sleep(Duration::from_secs(2)).await;
+
+            let mut retry_command = docker_command();
+            retry_command.args(runtime_container_run_args(server, &volume_path, &image));
+            let retry_output = retry_command
+                .output()
+                .await
+                .context("failed to start runtime container on retry")?;
+
+            if retry_output.status.success() {
+                let container_id = String::from_utf8_lossy(&retry_output.stdout).trim().to_string();
+                connect_interconnect_networks(registry, server, &container_id).await;
+                set_runtime_state(registry, config, server.id, "starting", Some(&container_id), None).await?;
+                return wait_for_startup(registry, server, config, &container_id, cancellation).await;
+            }
+        }
+
         let message = if stderr.is_empty() {
             "Failed to start runtime container.".to_string()
         } else {
@@ -1082,6 +1113,29 @@ async fn remove_container(name: &str) -> Result<()> {
         .await;
 
     Ok(())
+}
+
+/// Find and force-remove any Docker container that has bound the given
+/// port. This handles stale containers from deleted servers or crashed
+/// daemons that are still holding a port.
+async fn release_port_if_occupied(port: u64) {
+    // List all containers binding this port (format: container ID).
+    let output = docker_command()
+        .args(["ps", "-aq", "--filter", &format!("publish={port}")])
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return;
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for container_id in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = docker_command()
+            .args(["rm", "-f", container_id.trim()])
+            .output()
+            .await;
+    }
 }
 
 async fn fix_volume_permissions(volume_path: &Path) {
