@@ -1552,6 +1552,7 @@ mod tests {
                 uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 tick_interval: Duration::from_secs(30),
                 shutdown_timeout: Duration::from_secs(30),
+                allow_private_webhooks: false,
             },
             panel: crate::config::PanelSection {
                 url: "http://localhost".to_string(),

@@ -582,6 +582,7 @@ mod tests {
                 uuid: "00000000-0000-0000-0000-000000000000".to_string(),
                 tick_interval: Duration::from_secs(5),
                 shutdown_timeout: Duration::from_secs(30),
+                allow_private_webhooks: false,
             },
             panel: PanelSection {
                 url: url.to_string(),

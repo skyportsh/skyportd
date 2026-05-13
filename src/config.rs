@@ -23,6 +23,8 @@ pub struct DaemonSection {
     pub tick_interval: Duration,
     #[serde(with = "humantime_serde")]
     pub shutdown_timeout: Duration,
+    #[serde(default)]
+    pub allow_private_webhooks: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

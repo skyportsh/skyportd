@@ -1,17 +1,31 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::ToSocketAddrs;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use reqwest::Client;
 use tokio::select;
 use tokio::sync::{Mutex, watch};
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::api::{container_is_running, docker_command, runtime_container_name, send_command_to_server};
 use crate::config::DaemonConfig;
 use crate::server_registry::{ManagedServerRecord, ManagedServerWorkflow, ManagedServerWorkflowStep, ServerRegistry};
+
+/// Shared HTTP client for webhook calls (connection pooling).
+fn http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build reqwest client")
+    })
+}
 
 /// Tracks per-workflow state between ticks.
 struct WorkflowState {
@@ -91,6 +105,7 @@ impl WorkflowService {
 
                         for workflow in &server.workflows {
                             if let Err(error) = evaluate_workflow(
+                                &config,
                                 &self.server_registry,
                                 server,
                                 workflow,
@@ -117,7 +132,64 @@ impl WorkflowService {
     }
 }
 
+/// Returns true if the hostname resolves to a private or loopback IP address.
+///
+/// This is a best-effort check: a DNS rebinding attack could swap the resolved
+/// IP between our lookup and the actual request. For attacker-controlled domains
+/// this is a TOCTOU gap, but it blocks the common case (hardcoded private IPs,
+/// metadata endpoints, internal hostnames).
+async fn is_private_host(host: &str) -> bool {
+    // Check well-known private hostnames first (no DNS needed).
+    // Parse as IPv4Addr to avoid false positives on domain names like "127.example.com".
+    if host == "localhost"
+        || host == "localhost.localdomain"
+        || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+
+    let host = host.to_string();
+    // Resolve DNS on the blocking pool to avoid stalling Tokio workers
+    let result = tokio::task::spawn_blocking(move || -> bool {
+        let Ok(addrs) = (host.as_str(), 0).to_socket_addrs() else {
+            warn!(%host, "SSRF check: DNS resolution failed, allowing request");
+            return false;
+        };
+
+        for addr in addrs {
+            match addr.ip() {
+                std::net::IpAddr::V4(ipv4) => {
+                    if ipv4.is_private() || ipv4.is_loopback() || ipv4.is_unspecified() {
+                        return true;
+                    }
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    // Check IPv4-mapped IPv6 addresses (e.g. ::ffff:10.0.0.1)
+                    if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                        if ipv4.is_private() || ipv4.is_loopback() || ipv4.is_unspecified() {
+                            return true;
+                        }
+                    } else if ipv6.is_loopback()
+                        || ipv6.is_unspecified()
+                        || ipv6.is_unique_local()
+                        || ipv6.is_unicast_link_local()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    })
+    .await;
+
+    // Fail closed: if spawn_blocking itself panics or is cancelled, treat as private
+    result.unwrap_or(true)
+}
+
 async fn evaluate_workflow(
+    config: &DaemonConfig,
     registry: &ServerRegistry,
     server: &ManagedServerRecord,
     workflow: &ManagedServerWorkflow,
@@ -182,7 +254,7 @@ async fn evaluate_workflow(
 
     // Execute actions in order
     for action in &actions {
-        if let Err(error) = execute_action(action, registry, server).await {
+        if let Err(error) = execute_action(action, config, registry, server).await {
             warn!(
                 server_id = server.id,
                 workflow = %workflow.name,
@@ -335,6 +407,7 @@ fn chrono_today_abbrev() -> String {
 
 async fn execute_action(
     action: &ManagedServerWorkflowStep,
+    config: &DaemonConfig,
     registry: &ServerRegistry,
     server: &ManagedServerRecord,
 ) -> Result<()> {
@@ -404,21 +477,36 @@ async fn execute_action(
             );
         }
         "webhook" => {
-            let url = action.config.get("url").context("missing URL")?;
-            let method = action.config.get("method").unwrap_or(&"POST".to_string()).clone();
+            let url_str = action.config.get("url").context("missing URL")?;
+            let method = action.config.get("method").unwrap_or(&"POST".to_string()).to_ascii_uppercase();
 
-            let client = reqwest::Client::new();
+            // Block SSRF to private/internal networks unless explicitly allowed.
+            // Note: best-effort protection — DNS rebinding could theoretically
+            // swap the resolved IP between our lookup and the actual request.
+            if !config.daemon.allow_private_webhooks {
+                let parsed = Url::parse(url_str).context("invalid webhook URL")?;
+                let host = parsed.host_str().context("webhook URL missing host")?;
+
+                if is_private_host(host).await {
+                    anyhow::bail!(
+                        "webhook URL targets a private or internal address. \
+                         Set daemon.allow_private_webhooks=true in config to allow this."
+                    );
+                }
+            }
+
+            let client = http_client();
             let request = if method == "GET" {
-                client.get(url)
+                client.get(url_str)
             } else {
-                client.post(url).json(&serde_json::json!({
+                client.post(url_str).json(&serde_json::json!({
                     "server_id": server.id,
                     "server_name": server.name,
                     "server_status": server.status,
                 }))
             };
 
-            request.timeout(Duration::from_secs(10)).send().await?;
+            request.send().await?;
         }
         "delay" => {
             let seconds: u64 = action
