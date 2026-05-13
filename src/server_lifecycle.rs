@@ -272,9 +272,29 @@ async fn provision_and_install(
     command
         .arg("run")
         .arg("--rm")
-        .arg("--privileged")
         .arg("--name")
-        .arg(install_container_name(server.id))
+        .arg(install_container_name(server.id));
+
+    // Note: requires_privileged only applies to the install container.
+    // Runtime containers (runtime_container_run_args) intentionally always
+    // use Docker defaults without --privileged, since game server processes
+    // should never require full host access during normal operation.
+    if server.cargo.requires_privileged {
+        command.arg("--privileged");
+    } else {
+        command
+            .arg("--security-opt")
+            .arg("seccomp=unconfined")
+            .arg("--cap-drop=ALL")
+            .arg("--cap-add=CHOWN")
+            .arg("--cap-add=DAC_OVERRIDE")
+            .arg("--cap-add=NET_ADMIN")
+            .arg("--cap-add=SYS_PTRACE")
+            .arg("--cap-add=SETUID")
+            .arg("--cap-add=SETGID");
+    }
+
+    command
         .arg("-v")
         .arg(format!("{}:/mnt/server", volume_path.display()))
         .arg("-w")
@@ -1504,6 +1524,7 @@ mod tests {
                 install_script: None,
                 install_container: None,
                 install_entrypoint: None,
+                requires_privileged: false,
                 features: vec![],
                 docker_images: BTreeMap::new(),
                 file_denylist: vec![],

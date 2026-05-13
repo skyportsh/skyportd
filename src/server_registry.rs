@@ -109,6 +109,7 @@ pub struct ManagedServerCargo {
     pub docker_images: BTreeMap<String, String>,
     pub file_denylist: Vec<String>,
     pub file_hidden_list: Vec<String>,
+    pub requires_privileged: bool,
     pub variables: Vec<ManagedServerVariable>,
     pub definition: Value,
 }
@@ -188,6 +189,7 @@ impl ServerRegistry {
                 docker_images_json TEXT NOT NULL,
                 file_denylist_json TEXT NOT NULL,
                 file_hidden_list_json TEXT NOT NULL,
+                requires_privileged INTEGER NOT NULL DEFAULT 0,
                 variables_json TEXT NOT NULL,
                 definition_json TEXT NOT NULL,
                 allocation_json TEXT NOT NULL DEFAULT '{}',
@@ -239,6 +241,7 @@ impl ServerRegistry {
                 startup_command, config_files, config_startup, config_logs, config_stop,
                 install_script, install_container, install_entrypoint,
                 features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
+                requires_privileged,
                 variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, workflows_json, container_id, last_error
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
@@ -249,7 +252,8 @@ impl ServerRegistry {
                 ?19, ?20, ?21, ?22, ?23,
                 ?24, ?25, ?26,
                 ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
+                ?31,
+                ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39
             )
             ON CONFLICT(id) DO UPDATE SET
                 node_id = excluded.node_id,
@@ -281,6 +285,7 @@ impl ServerRegistry {
                 docker_images_json = excluded.docker_images_json,
                 file_denylist_json = excluded.file_denylist_json,
                 file_hidden_list_json = excluded.file_hidden_list_json,
+                requires_privileged = excluded.requires_privileged,
                 variables_json = excluded.variables_json,
                 definition_json = excluded.definition_json,
                 allocation_json = excluded.allocation_json,
@@ -321,6 +326,7 @@ impl ServerRegistry {
                 serde_json::to_string(&server.cargo.docker_images)?,
                 serde_json::to_string(&server.cargo.file_denylist)?,
                 serde_json::to_string(&server.cargo.file_hidden_list)?,
+                server.cargo.requires_privileged,
                 serde_json::to_string(&server.cargo.variables)?,
                 serde_json::to_string(&server.cargo.definition)?,
                 serde_json::to_string(&server.allocation)?,
@@ -541,6 +547,16 @@ impl ServerRegistry {
             )?;
         }
 
+        if !existing_columns
+            .iter()
+            .any(|column| column == "requires_privileged")
+        {
+            connection.execute(
+                "ALTER TABLE servers ADD COLUMN requires_privileged INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -595,7 +611,7 @@ SELECT
     startup_command, config_files, config_startup, config_logs, config_stop,
     install_script, install_container, install_entrypoint,
     features_json, docker_images_json, file_denylist_json, file_hidden_list_json,
-    variables_json, definition_json, allocation_json, firewall_rules_json, interconnects_json, workflows_json, container_id, last_error
+    variables_json, requires_privileged, definition_json, allocation_json, firewall_rules_json, interconnects_json, workflows_json, container_id, last_error
 FROM servers
 "#;
 
@@ -609,12 +625,12 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
         docker_image: row.get(7)?,
-        allocation: parse_json(row.get::<_, String>(32)?)?,
-        firewall_rules: parse_json(row.get::<_, String>(33)?)?,
-        interconnects: parse_json(row.get::<_, String>(34)?)?,
-        workflows: parse_json(row.get::<_, String>(35)?)?,
-        container_id: row.get(36)?,
-        last_error: row.get(37)?,
+        allocation: parse_json(row.get::<_, String>(33)?)?,
+        firewall_rules: parse_json(row.get::<_, String>(34)?)?,
+        interconnects: parse_json(row.get::<_, String>(35)?)?,
+        workflows: parse_json(row.get::<_, String>(36)?)?,
+        container_id: row.get(37)?,
+        last_error: row.get(38)?,
         user: ManagedServerUser {
             id: row.get(8)?,
             name: row.get(9)?,
@@ -643,7 +659,8 @@ fn map_server_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedServerReco
             file_denylist: parse_json(row.get::<_, String>(28)?)?,
             file_hidden_list: parse_json(row.get::<_, String>(29)?)?,
             variables: parse_json(row.get::<_, String>(30)?)?,
-            definition: parse_json(row.get::<_, String>(31)?)?,
+            requires_privileged: row.get::<_, i32>(31)? != 0,
+            definition: parse_json(row.get::<_, String>(32)?)?,
         },
     })
 }
@@ -713,6 +730,7 @@ mod tests {
                 )]),
                 file_denylist: vec!["server.properties".to_string()],
                 file_hidden_list: vec![".env".to_string()],
+                requires_privileged: false,
                 variables: vec![ManagedServerVariable {
                     name: "Jar".to_string(),
                     description: "Jar to run".to_string(),
