@@ -136,6 +136,35 @@ pub(super) async fn handle_backup(
                 ));
             }
 
+            // Check disk quota before restoring
+            let disk_limit = (server.limits.disk_mib as u64) * 1024 * 1024;
+            let uncompressed_size = gzip_uncompressed_size(&backup_path)
+                .map_err(|e| internal_error(anyhow::anyhow!("failed to check backup size: {e}")))?;
+
+            if uncompressed_size > disk_limit {
+                let msg = format!(
+                    "Backup ({}) exceeds server disk limit ({})",
+                    format_backup_size(uncompressed_size),
+                    format_backup_size(disk_limit),
+                );
+                warn!(server_id = server.id, %msg, "backup exceeds disk quota");
+                let _ = notify_backup_status(
+                    &config,
+                    server.id,
+                    payload.backup_id,
+                    "failed",
+                    0,
+                    Some(&msg),
+                )
+                .await;
+                return Err(error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Backup cannot be restored: it exceeds the server's disk limit ({}/{}).",
+                        format_backup_size(uncompressed_size),
+                        format_backup_size(disk_limit)),
+                ));
+            }
+
             // Clear the volume directory
             if volume_path.exists() {
                 for entry in std::fs::read_dir(&volume_path).map_err(|e| {
@@ -315,4 +344,48 @@ pub(super) async fn notify_backup_status(
         .await?;
 
     Ok(())
+}
+
+/// Get the uncompressed size of a gzip archive in bytes.
+///
+/// Uses `gzip -l` which prints the uncompressed total of the gzip stream.
+/// This includes tar metadata overhead (~512 bytes per entry), so it is a
+/// safe upper bound for the actual extracted content size.
+fn gzip_uncompressed_size(path: &std::path::Path) -> Result<u64> {
+    let output = std::process::Command::new("gzip")
+        .arg("-l")
+        .arg(path)
+        .output()
+        .context("failed to run gzip -l")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!("gzip -l failed: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // gzip -l output format:
+    //   compressed  uncompressed  ratio uncompressed_name
+    //       12345         67890  18.2% backup.tar
+    let line = stdout.lines().nth(1).context("unexpected gzip output format")?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let uncompressed = fields
+        .get(1)
+        .context("unexpected gzip output format")?
+        .parse::<u64>()
+        .context("failed to parse gzip uncompressed size")?;
+
+    Ok(uncompressed)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gzip_parse_size_from_l_output() {
+        let output = "         compressed        uncompressed  ratio uncompressed_name\n              12345              67890  18.2% backup.tar\n";
+        let line = output.lines().nth(1).unwrap();
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let size: u64 = fields.get(1).unwrap().parse().unwrap();
+        assert_eq!(size, 67890);
+    }
 }
