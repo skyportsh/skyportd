@@ -239,6 +239,9 @@ const SSH_FX_FAILURE: u32 = 4;
 const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 
 fn read_u32(data: &[u8], offset: usize) -> u32 {
+    if offset + 4 > data.len() {
+        return 0;
+    }
     u32::from_be_bytes([
         data[offset],
         data[offset + 1],
@@ -248,8 +251,15 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 }
 
 fn read_string(data: &[u8], offset: usize) -> (&[u8], usize) {
+    if offset + 4 > data.len() {
+        return (&[], offset);
+    }
     let len = read_u32(data, offset) as usize;
-    (&data[offset + 4..offset + 4 + len], offset + 4 + len)
+    let end = offset.saturating_add(4).saturating_add(len);
+    if end > data.len() {
+        return (&[], offset);
+    }
+    (&data[offset + 4..end], end)
 }
 
 fn write_u32(buf: &mut Vec<u8>, val: u32) {
