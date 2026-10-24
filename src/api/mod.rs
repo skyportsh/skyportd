@@ -211,10 +211,12 @@ struct WsClientEvent {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct WsTokenPayload {
+pub(super) struct WsTokenPayload {
     daemon_uuid: String,
     exp: u64,
     panel_version: String,
+    #[serde(default)]
+    permissions: Vec<String>,
     server_id: u64,
 }
 
@@ -2046,6 +2048,7 @@ mod tests {
                 daemon_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 exp: current_unix_timestamp() + 60,
                 panel_version: CURRENT_VERSION.to_string(),
+                permissions: vec!["console".to_string()],
                 server_id: 42,
             })
             .expect("token payload json")
@@ -2083,6 +2086,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn ws_permission_check_matches_power_and_wildcard() {
+        use super::websocket::has_permission;
+
+        assert!(has_permission(&["*".to_string()], "power"));
+        assert!(has_permission(&["power".to_string(), "console".to_string()], "power"));
+        assert!(!has_permission(&["console".to_string()], "power"));
+        assert!(!has_permission(&[], "power"));
     }
 
     #[test]

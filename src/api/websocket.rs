@@ -50,6 +50,7 @@ pub(super) async fn handle_server_ws(
     request_panel_version: String,
 ) {
     let mut authenticated = false;
+    let mut token_permissions: Vec<String> = Vec::new();
     let mut stats_subscribed = false;
     let mut last_id = 0_u64;
     let mut last_status: Option<String> = None;
@@ -133,8 +134,9 @@ pub(super) async fn handle_server_ws(
                                 &request_uuid,
                                 &request_panel_version,
                             ) {
-                                Ok(()) => {
+                                Ok(payload) => {
                                     authenticated = true;
+                                    token_permissions = payload.permissions;
 
                                     if send_ws_event(&mut socket, "auth success", Vec::new()).await.is_err() {
                                         return;
@@ -171,7 +173,15 @@ pub(super) async fn handle_server_ws(
                             continue;
                         }
 
-                        match handle_ws_client_event(&registry, server_id, &mut socket, event, &mut stats_subscribed, &mut last_id).await {
+                        match handle_ws_client_event(
+                            &registry,
+                            server_id,
+                            &mut socket,
+                            event,
+                            &token_permissions,
+                            &mut stats_subscribed,
+                            &mut last_id,
+                        ).await {
                             Ok(()) => {}
                             Err(error) => {
                                 if send_ws_event(&mut socket, "daemon error", vec![Value::String(error.to_string())]).await.is_err() {
@@ -243,6 +253,7 @@ pub(super) async fn handle_ws_client_event(
     server_id: u64,
     socket: &mut WebSocket,
     event: WsClientEvent,
+    permissions: &[String],
     stats_subscribed: &mut bool,
     last_id: &mut u64,
 ) -> Result<()> {
@@ -264,6 +275,10 @@ pub(super) async fn handle_ws_client_event(
             send_stats_event(socket, &server).await?;
         }
         "set state" => {
+            if !has_permission(permissions, "power") {
+                bail!("You do not have permission to manage power for this server.");
+            }
+
             let signal = parse_power_signal(event.args.first())?;
             apply_power_signal(registry, &server, signal).await?;
         }
@@ -295,7 +310,7 @@ pub fn authenticate_ws_event(
     server_id: u64,
     request_uuid: &str,
     request_panel_version: &str,
-) -> Result<()> {
+) -> Result<WsTokenPayload> {
     let secret = expected_token
         .filter(|token| !token.is_empty())
         .context("Missing daemon callback token.")?;
@@ -344,7 +359,11 @@ pub fn authenticate_ws_event(
         bail!("The websocket token has expired.");
     }
 
-    Ok(())
+    Ok(payload)
+}
+
+pub fn has_permission(permissions: &[String], permission: &str) -> bool {
+    permissions.iter().any(|p| p == "*" || p == permission)
 }
 
 pub fn runtime_status_after_start_request(is_running: bool) -> &'static str {
