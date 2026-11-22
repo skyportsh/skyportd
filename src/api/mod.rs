@@ -6,15 +6,13 @@ use filesystem::*;
 use backups::*;
 use websocket::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
-use std::time::Duration;
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -26,7 +24,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -35,6 +32,7 @@ use tracing::{info, warn};
 
 use crate::config::{DaemonConfig, NodeSection, managed_server_volume_path, project_root};
 use crate::configuration;
+use crate::docker::{DockerOutput, docker_command};
 #[cfg(test)]
 use crate::server_registry::ConsoleMessageRecord;
 use crate::server_registry::{
@@ -801,6 +799,8 @@ async fn delete_server(
             )
         })?;
 
+    forget_resource_snapshot(server_id);
+
     if deleted {
         info!(server_id, "server state deleted");
     } else {
@@ -1129,12 +1129,15 @@ async fn extract_server_archive(
     }))
 }
 
+/// Maximum size of a file accepted by the upload endpoint.
+const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
 async fn upload_server_file(
     Path(server_id): Path<u64>,
     Query(query): Query<ServerUploadFileQuery>,
     State(state): State<ApiState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> std::result::Result<Json<ServerFilesystemMutationResponse>, (StatusCode, Json<ApiErrorResponse>)>
 {
     let config = state.config_rx.borrow().clone();
@@ -1144,18 +1147,86 @@ async fn upload_server_file(
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let target_path = query.path.unwrap_or_default();
     let file_name = query.name;
-    let bytes = body.to_vec();
 
-    tokio::task::spawn_blocking(move || upload_file(&server, &target_path, &file_name, &bytes))
-        .await
-        .context("failed to join file upload task")
-        .map_err(internal_error)?
-        .map_err(filesystem_error)?;
+    let final_path = tokio::task::spawn_blocking(move || {
+        prepare_upload_target(&server, &target_path, &file_name)
+    })
+    .await
+    .context("failed to join file upload task")
+    .map_err(internal_error)?
+    .map_err(filesystem_error)?;
+
+    // Stream into a hidden temporary file so memory stays flat whatever the
+    // upload size, and so a failed transfer never leaves a truncated file
+    // under its real name.
+    let temp_path = final_path.with_file_name(format!(
+        ".{}.{}.upload",
+        final_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let result = stream_body_to_file(body, &temp_path, MAX_UPLOAD_BYTES).await;
+
+    let result = match result {
+        Ok(()) if final_path.exists() => Err(anyhow::anyhow!("A file with that name already exists.")),
+        Ok(()) => tokio::fs::rename(&temp_path, &final_path)
+            .await
+            .with_context(|| format!("failed to write {}", final_path.display())),
+        Err(error) => Err(error),
+    };
+
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        return Err(filesystem_error(error));
+    }
 
     Ok(Json(ServerFilesystemMutationResponse {
         message: "File uploaded successfully.".to_string(),
         ok: true,
     }))
+}
+
+async fn stream_body_to_file(
+    body: axum::body::Body,
+    path: &StdPath,
+    max_bytes: u64,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut stream = body.into_data_stream();
+    let mut written = 0_u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read the upload body")?;
+
+        written += chunk.len() as u64;
+
+        if written > max_bytes {
+            bail!("Uploaded files may not be larger than 1 GB.");
+        }
+
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
+    file.flush().await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1278,7 +1349,7 @@ async fn notify_transfer_status(
     let panel_url = config.panel.url.trim_end_matches('/');
     let daemon_secret = config.panel.daemon_secret.as_deref().context("missing daemon secret")?;
 
-    reqwest::Client::new()
+    crate::http::client()
         .post(format!("{panel_url}/api/daemon/servers/{server_id}/runtime"))
         .bearer_auth(daemon_secret)
         .json(&serde_json::json!({
@@ -1337,14 +1408,16 @@ async fn download_install_log(
         .map_err(internal_error)?
         .join("install.log");
 
-    let contents = std::fs::read(&path).map_err(|error| {
+    let file = tokio::fs::File::open(&path).await.map_err(|error| {
         error_response(
             StatusCode::NOT_FOUND,
             format!("failed to read install log: {error}"),
         )
     })?;
 
-    let mut response = contents.into_response();
+    // Streamed so a large log never has to fit in memory.
+    let mut response = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file))
+        .into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -1400,48 +1473,263 @@ fn server_requires_recreate(existing: &ManagedServerRecord, server: &ManagedServ
         || existing.docker_image != server.docker_image
 }
 
-pub(super) async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
-    let name = runtime_container_name(server.id);
-    let disk_bytes = current_disk_usage_bytes(server).await.unwrap_or(0);
-    let output = docker_command()
+/// A stats sample older than this is not trusted.
+const STATS_SAMPLE_MAX_AGE: Duration = Duration::from_secs(5);
+/// How long a caller waits for the first sample of a fresh collector.
+const STATS_FIRST_SAMPLE_WAIT: Duration = Duration::from_secs(4);
+/// A collector stops when nobody asked for its numbers for this long.
+const STATS_COLLECTOR_IDLE: Duration = Duration::from_secs(20);
+/// Minimum delay before restarting a collector that just died, so a stopped
+/// container does not spawn a failing `docker stats` on every request.
+const STATS_COLLECTOR_RESTART_DELAY: Duration = Duration::from_secs(2);
+/// Disk usage is recomputed in the background once it is older than this.
+/// Walking a large volume is expensive, so readers never wait for it after
+/// the first computation.
+const DISK_CACHE_TTL: Duration = Duration::from_secs(180);
+
+/// State shared between a stats collector task and the requests reading it.
+struct StatsCollector {
+    state: std::sync::Mutex<CollectorState>,
+    updated: tokio::sync::Notify,
+}
+
+struct CollectorState {
+    /// `Some(None)` is a sample saying the container is not running.
+    sample: Option<(Instant, Option<Value>)>,
+    last_read: Instant,
+    alive: bool,
+    died_at: Option<Instant>,
+}
+
+impl StatsCollector {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CollectorState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Default)]
+struct DiskCache {
+    value: std::sync::Mutex<Option<(Instant, u64)>>,
+    refreshing: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct ResourceEntry {
+    collector: Option<Arc<StatsCollector>>,
+    disk: Arc<DiskCache>,
+}
+
+static RESOURCE_CACHE: LazyLock<std::sync::Mutex<HashMap<u64, ResourceEntry>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Drops the cached state of a server that no longer exists. Its collector
+/// stops by itself once it has been idle.
+pub(crate) fn forget_resource_snapshot(server_id: u64) {
+    RESOURCE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&server_id);
+}
+
+/// Returns the running collector of a server, starting one if needed.
+fn collector_for(server_id: u64) -> Option<Arc<StatsCollector>> {
+    let mut cache = RESOURCE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = cache.entry(server_id).or_default();
+
+    if let Some(collector) = &entry.collector {
+        let mut state = collector.lock();
+
+        if state.alive {
+            state.last_read = Instant::now();
+            return Some(Arc::clone(collector));
+        }
+
+        if state
+            .died_at
+            .is_some_and(|at| at.elapsed() < STATS_COLLECTOR_RESTART_DELAY)
+        {
+            return None;
+        }
+    }
+
+    let collector = Arc::new(StatsCollector {
+        state: std::sync::Mutex::new(CollectorState {
+            sample: None,
+            last_read: Instant::now(),
+            alive: true,
+            died_at: None,
+        }),
+        updated: tokio::sync::Notify::new(),
+    });
+
+    entry.collector = Some(Arc::clone(&collector));
+    tokio::spawn(run_stats_collector(server_id, Arc::clone(&collector)));
+
+    Some(collector)
+}
+
+/// Keeps ONE persistent `docker stats` process per watched server. It prints a
+/// sample every second, so any number of clients cost a single process and no
+/// process is spawned per sample.
+async fn run_stats_collector(server_id: u64, collector: Arc<StatsCollector>) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let spawned = docker_command()
         .arg("stats")
-        .arg("--no-stream")
         .arg("--format")
         .arg("{{json .}}")
-        .arg(&name)
-        .output()
-        .await
-        .context("failed to inspect docker stats")?;
+        .arg(runtime_container_name(server_id))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 
-    if !output.status.success() {
-        return Ok(json!({
+    if let Ok(mut child) = spawned {
+        if let Some(stdout) = child.stdout.take() {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut idle_check = time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    line = lines.next_line() => {
+                        let Ok(Some(line)) = line else { break };
+
+                        // The client redraws the terminal with escape codes
+                        // around the JSON object.
+                        let (Some(start), Some(end)) = (line.find('{'), line.rfind('}')) else {
+                            continue;
+                        };
+
+                        if let Ok(stats) = serde_json::from_str::<Value>(&line[start..=end]) {
+                            // A stopped or removed container keeps printing
+                            // placeholders ("--") or all zeros.
+                            let running = !stats["MemUsage"]
+                                .as_str()
+                                .is_some_and(|usage| usage.starts_with("--") || usage.starts_with("0B /"));
+
+                            collector.lock().sample =
+                                Some((Instant::now(), running.then_some(stats)));
+                            collector.updated.notify_waiters();
+                        }
+                    }
+                    _ = idle_check.tick() => {
+                        if collector.lock().last_read.elapsed() > STATS_COLLECTOR_IDLE {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // `kill_on_drop` ends the process when `child` goes out of scope.
+    }
+
+    {
+        let mut state = collector.lock();
+        state.alive = false;
+        state.died_at = Some(Instant::now());
+        state.sample = None;
+    }
+    collector.updated.notify_waiters();
+}
+
+/// Latest stats of a server. `None` means the container is not running.
+async fn latest_container_stats(server_id: u64) -> Option<Value> {
+    let collector = collector_for(server_id)?;
+    let deadline = Instant::now() + STATS_FIRST_SAMPLE_WAIT;
+
+    loop {
+        // Register for the notification before reading to not miss it.
+        let notified = collector.updated.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        {
+            let state = collector.lock();
+
+            if let Some((at, stats)) = &state.sample {
+                if at.elapsed() < STATS_SAMPLE_MAX_AGE {
+                    return stats.clone();
+                }
+            }
+
+            if !state.alive {
+                return None;
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+
+        if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+            return None;
+        }
+    }
+}
+
+/// Disk usage of a volume. The first call computes it; later calls return the
+/// cached value at once and refresh it in the background when it is stale.
+async fn cached_disk_usage(server: &ManagedServerRecord) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    let cache = {
+        let mut cache = RESOURCE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        Arc::clone(&cache.entry(server.id).or_default().disk)
+    };
+
+    let cached = *cache
+        .value
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    match cached {
+        None => {
+            let bytes = current_disk_usage_bytes(server).await.unwrap_or(0);
+            *cache.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((Instant::now(), bytes));
+            bytes
+        }
+        Some((at, bytes)) => {
+            if at.elapsed() >= DISK_CACHE_TTL && !cache.refreshing.swap(true, Ordering::AcqRel) {
+                let server = server.clone();
+
+                tokio::spawn(async move {
+                    let bytes = current_disk_usage_bytes(&server).await.unwrap_or(0);
+                    *cache.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some((Instant::now(), bytes));
+                    cache.refreshing.store(false, Ordering::Release);
+                });
+            }
+
+            bytes
+        }
+    }
+}
+
+pub(super) async fn current_resource_snapshot(server: &ManagedServerRecord) -> Result<Value> {
+    let (stats, disk_bytes) =
+        tokio::join!(latest_container_stats(server.id), cached_disk_usage(server));
+
+    Ok(match stats {
+        Some(stats) => json!({
+            "disk_bytes": disk_bytes,
+            "server": server.id,
+            "running": true,
+            "state": server.status,
+            "stats": stats,
+        }),
+        None => json!({
             "disk_bytes": disk_bytes,
             "server": server.id,
             "running": false,
             "state": server.status,
-        }));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(json!({
-            "disk_bytes": disk_bytes,
-            "server": server.id,
-            "running": false,
-            "state": server.status,
-        }));
-    }
-
-    let stats: Value =
-        serde_json::from_str(&stdout).context("failed to parse docker stats payload")?;
-
-    Ok(json!({
-        "disk_bytes": disk_bytes,
-        "server": server.id,
-        "running": true,
-        "state": server.status,
-        "stats": stats,
-    }))
+        }),
+    })
 }
 
 pub(super) async fn apply_power_signal(
@@ -1666,7 +1954,7 @@ async fn graceful_stop(
         .arg("-t")
         .arg("10")
         .arg(runtime_container_name(server.id))
-        .output()
+        .docker_output()
         .await
         .context("failed to issue docker stop")?;
 
@@ -1709,7 +1997,7 @@ async fn kill_server(registry: &ServerRegistry, server: &ManagedServerRecord) ->
     let output = docker_command()
         .arg("kill")
         .arg(runtime_container_name(server.id))
-        .output()
+        .docker_output()
         .await
         .context("failed to issue docker kill")?;
 
@@ -1847,7 +2135,7 @@ pub async fn container_is_running(server_id: u64) -> Result<bool> {
         .arg("-f")
         .arg("{{.State.Running}}")
         .arg(runtime_container_name(server_id))
-        .output()
+        .docker_output()
         .await
         .context("failed to inspect runtime container")?;
 
@@ -1870,7 +2158,7 @@ async fn remove_container(name: &str) -> Result<()> {
         .arg("rm")
         .arg("-f")
         .arg(name)
-        .output()
+        .docker_output()
         .await;
 
     Ok(())
@@ -1882,12 +2170,6 @@ pub fn runtime_container_name(server_id: u64) -> String {
 
 fn install_container_name(server_id: u64) -> String {
     format!("skyport-install-{server_id}")
-}
-
-pub fn docker_command() -> Command {
-    let mut command = Command::new("docker");
-    command.kill_on_drop(true);
-    command
 }
 
 pub(super) fn resolve_volume_path(server: &ManagedServerRecord) -> Result<PathBuf> {
@@ -1939,11 +2221,796 @@ fn error_response(status: StatusCode, message: String) -> (StatusCode, Json<ApiE
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
     use super::websocket::{authenticate_ws_event, console_event_name, hex_encode, parse_power_signal, parse_ws_client_event, runtime_status_after_start_request, ws_event_payload};
+
+    fn ws_test_config(node_id: u64) -> DaemonConfig {
+        DaemonConfig {
+            daemon: crate::config::DaemonSection {
+                name: "skyportd".to_string(),
+                uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                tick_interval: Duration::from_secs(30),
+                shutdown_timeout: Duration::from_secs(30),
+                allow_private_webhooks: false,
+            },
+            panel: crate::config::PanelSection {
+                url: "http://localhost".to_string(),
+                configuration_token: None,
+                daemon_secret: None,
+                daemon_callback_token: Some("ws-secret".to_string()),
+                node_id: Some(node_id),
+            },
+            logging: crate::config::LoggingSection {
+                level: "info".to_string(),
+                format: crate::config::LogFormat::Pretty,
+            },
+            runtime: crate::config::RuntimeSection { worker_threads: 1 },
+            node: None,
+        }
+    }
+
+    fn ws_token(config: &DaemonConfig, server_id: u64) -> String {
+        let payload = WsTokenPayload {
+            daemon_uuid: config.daemon.uuid.clone(),
+            exp: current_unix_timestamp() + 600,
+            panel_version: CURRENT_VERSION.to_string(),
+            permissions: vec!["*".to_string()],
+            server_id,
+        };
+        let payload_hex = hex_encode(serde_json::to_string(&payload).unwrap().as_bytes());
+        let signature = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, b"ws-secret"),
+            payload_hex.as_bytes(),
+        );
+
+        format!("{payload_hex}.{}", hex_encode(signature.as_ref()))
+    }
+
+    /// Reads websocket events until `predicate` matches or `wait` elapses.
+    async fn next_ws_event<S>(
+        stream: &mut S,
+        wait: Duration,
+    ) -> Option<(String, Vec<Value>)>
+    where
+        S: futures_util::Stream<
+                Item = std::result::Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use futures_util::StreamExt;
+
+        loop {
+            let message = tokio::time::timeout(wait, stream.next()).await.ok()??.ok()?;
+
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+
+                return Some((
+                    value["event"].as_str().unwrap().to_string(),
+                    value["args"].as_array().cloned().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_streams_live_console_without_replaying_history() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let directory = tempdir().unwrap();
+        let registry = ServerRegistry::new(directory.path().join("registry.db"));
+        registry.initialize().unwrap();
+        let server = sample_managed_server();
+        registry.upsert_server(&server).unwrap();
+
+        // A long history that used to be replayed on every connection.
+        for index in 0..300 {
+            registry
+                .append_console_message(server.id, "stdout", &format!("old {index}"))
+                .unwrap();
+        }
+
+        let config = ws_test_config(server.node_id);
+        let (config_tx, config_rx) = watch::channel(config.clone());
+        let state = ApiState {
+            config_rx,
+            config_tx,
+            server_registry: registry.clone(),
+        };
+        let router = Router::new()
+            .route("/api/daemon/servers/{server_id}/ws", get(server_ws))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let url = format!(
+            "ws://{address}/api/daemon/servers/{}/ws?uuid={}&panel_version={CURRENT_VERSION}",
+            server.id, config.daemon.uuid
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+        socket
+            .send(Message::Text(
+                json!({"event": "auth", "args": [ws_token(&config, server.id)]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let (event, _) = next_ws_event(&mut socket, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "auth success");
+
+        // Only status events and no history: the next console event must be
+        // the live line we append now.
+        registry
+            .append_console_message(server.id, "stdout", "live line")
+            .unwrap();
+
+        let mut saw_status = false;
+        let begin = Instant::now();
+        loop {
+            let (event, args) = next_ws_event(&mut socket, Duration::from_secs(2))
+                .await
+                .expect("timed out waiting for the live console line");
+
+            match event.as_str() {
+                "status" => saw_status = true,
+                "console output" => {
+                    assert_eq!(args[0], "live line", "history was replayed on connect");
+                    break;
+                }
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert!(saw_status);
+        assert!(begin.elapsed() < Duration::from_millis(600), "live delivery was slow");
+
+        // History is delivered on request, last 50 lines only.
+        socket
+            .send(Message::Text(json!({"event": "send logs", "args": []}).to_string().into()))
+            .await
+            .unwrap();
+
+        let mut lines = Vec::new();
+        while let Some((event, args)) = next_ws_event(&mut socket, Duration::from_millis(500)).await {
+            if event == "console output" {
+                lines.push(args[0].as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines.last().unwrap(), "live line");
+
+        // A burst larger than the broadcast buffer while the client is not
+        // reading must still end with the newest line delivered.
+        for index in 0..3000 {
+            registry
+                .append_console_message(server.id, "stdout", &format!("burst {index}"))
+                .unwrap();
+        }
+
+        // Every hole in the stream must be announced by a skip notice.
+        let mut last = String::new();
+        let mut previous: Option<u64> = None;
+        let mut gap_announced = true;
+        while let Some((event, args)) = next_ws_event(&mut socket, Duration::from_secs(2)).await {
+            match event.as_str() {
+                "daemon message" => {
+                    assert!(args[0].as_str().unwrap().contains("skipped"));
+                    gap_announced = true;
+                }
+                "console output" => {
+                    last = args[0].as_str().unwrap().to_string();
+
+                    if let Some(index) = last.strip_prefix("burst ").and_then(|n| n.parse::<u64>().ok()) {
+                        if let Some(previous) = previous {
+                            if index != previous + 1 {
+                                assert!(gap_announced, "silent gap between burst {previous} and {index}");
+                            }
+                        }
+                        previous = Some(index);
+                        gap_announced = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(last, "burst 2999");
+
+        // Status changes are pushed without polling.
+        registry
+            .set_server_runtime(server.id, "running", None, None)
+            .unwrap();
+        let (event, args) = next_ws_event(&mut socket, Duration::from_millis(500))
+            .await
+            .expect("status change was not pushed");
+        assert_eq!(event, "status");
+        assert_eq!(args[0], "running");
+
+        let _ = socket.close(None).await;
+    }
+
+    #[tokio::test]
+    async fn upload_stream_is_written_to_disk_in_chunks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("upload.bin");
+        let chunks = (0..64).map(|index| Ok::<_, std::io::Error>(vec![index as u8; 4096]));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+
+        stream_body_to_file(body, &path, 1024 * 1024).await.unwrap();
+
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written.len(), 64 * 4096);
+        assert_eq!(written[4096], 1);
+    }
+
+    #[tokio::test]
+    async fn upload_stream_rejects_oversized_bodies() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("too-big.bin");
+        let chunks = (0..8).map(|_| Ok::<_, std::io::Error>(vec![0u8; 1024]));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+
+        let error = stream_body_to_file(body, &path, 4096).await.unwrap_err();
+
+        assert!(error.to_string().contains("larger than 1 GB"));
+    }
+
+    #[tokio::test]
+    async fn upload_stream_refuses_to_overwrite_a_partial_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("existing.bin");
+        std::fs::write(&path, "x").unwrap();
+
+        let body = Body::from("data");
+
+        assert!(stream_body_to_file(body, &path, 1024).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
+    }
+
+    /// Needs a running docker daemon: `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn stats_use_one_persistent_docker_process_per_server() {
+        let mut server = sample_managed_server();
+        server.id = 987_010;
+        server.status = "running".to_string();
+        let name = runtime_container_name(server.id);
+
+        let _ = docker_command().args(["rm", "-f", &name]).output().await;
+        let started = docker_command()
+            .args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])
+            .output()
+            .await
+            .unwrap();
+        assert!(started.status.success());
+
+        // Twenty clients ask at once and several times in a row.
+        for _ in 0..3 {
+            let results = futures_util::future::join_all(
+                (0..20).map(|_| current_resource_snapshot(&server)),
+            )
+            .await;
+
+            for result in &results {
+                let payload = result.as_ref().unwrap();
+                assert_eq!(payload["running"], true);
+                assert_eq!(payload["server"], 987_010);
+                assert!(payload["stats"]["MemUsage"].is_string());
+            }
+
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+
+        // Exactly one `docker stats` process serves all of them.
+        let processes = tokio::process::Command::new("ps")
+            .args(["-axo", "command"])
+            .output()
+            .await
+            .unwrap();
+        let count = String::from_utf8_lossy(&processes.stdout)
+            .lines()
+            .filter(|line| line.contains("docker stats") && line.contains(&name))
+            .count();
+        assert_eq!(count, 1, "expected a single persistent docker stats process");
+
+        // Reading is instant once the collector is warm.
+        let begin = Instant::now();
+        current_resource_snapshot(&server).await.unwrap();
+        assert!(begin.elapsed() < Duration::from_millis(100));
+
+        // A stopped container reports not running.
+        let _ = docker_command().args(["rm", "-f", &name]).output().await;
+        let mut stopped = false;
+        for _ in 0..40 {
+            let payload = current_resource_snapshot(&server).await.unwrap();
+
+            if payload["running"] == false {
+                stopped = true;
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(stopped, "a removed container still reports running");
+
+        forget_resource_snapshot(server.id);
+    }
+
+    // ---------------------------------------------------------------------
+    // Integration with the depot images (needs docker and the images built
+    // with `depot/tests/run.sh --keep <id>`; run with `--ignored`).
+    // ---------------------------------------------------------------------
+
+    const SH_PROGRAM: &str = r#"echo "ready-marker port=$1 mem=$SERVER_MEMORY ip=$INTERNAL_IP user=$(id -un) cwd=$(pwd)"
+while read l; do
+  echo "got:$l"
+  if [ "$l" = "stop" ]; then exit 0; fi
+done
+"#;
+
+    const NODE_PROGRAM: &str = r#"console.log(`ready-marker port=${process.argv[2]} mem=${process.env.SERVER_MEMORY} ip=${process.env.INTERNAL_IP} user=${require('os').userInfo().username} cwd=${process.cwd()}`);
+require('readline').createInterface({ input: process.stdin }).on('line', (l) => {
+  console.log('got:' + l);
+  if (l === 'stop') process.exit(0);
+});
+"#;
+
+    const PYTHON_PROGRAM: &str = r#"import getpass, os, sys
+print(f"ready-marker port={sys.argv[1]} mem={os.environ.get('SERVER_MEMORY')} ip={os.environ.get('INTERNAL_IP')} user={getpass.getuser()} cwd={os.getcwd()}", flush=True)
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    print("got:" + line, flush=True)
+    if line == "stop":
+        sys.exit(0)
+"#;
+
+    const GO_PROGRAM: &str = r#"package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+)
+
+func main() {
+	cwd, _ := os.Getwd()
+	fmt.Printf("ready-marker port=%s mem=%s ip=%s user=%s cwd=%s\n", os.Args[1], os.Getenv("SERVER_MEMORY"), os.Getenv("INTERNAL_IP"), os.Getenv("USER"), cwd)
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fmt.Println("got:" + line)
+		if line == "stop" {
+			os.Exit(0)
+		}
+	}
+}
+"#;
+
+    const JAVA_PROGRAM: &str = r#"import java.util.Scanner;
+
+public class Run {
+    public static void main(String[] args) {
+        System.out.println("ready-marker port=" + args[0] + " mem=" + System.getenv("SERVER_MEMORY") + " ip=" + System.getenv("INTERNAL_IP") + " user=" + System.getProperty("user.name") + " cwd=" + System.getProperty("user.dir"));
+        Scanner scanner = new Scanner(System.in);
+        while (scanner.hasNextLine()) {
+            String line = scanner.nextLine();
+            System.out.println("got:" + line);
+            if (line.equals("stop")) System.exit(0);
+        }
+    }
+}
+"#;
+
+    fn depot_image_tag(id: &str) -> String {
+        let info = std::process::Command::new("docker")
+            .args(["info", "--format", "{{.Architecture}}"])
+            .output()
+            .expect("docker must be installed");
+        let architecture = String::from_utf8_lossy(&info.stdout);
+        let suffix = if architecture.contains("aarch64") || architecture.contains("arm64") {
+            "linux-arm64"
+        } else {
+            "linux-amd64"
+        };
+
+        format!("depot-test/{id}:{suffix}")
+    }
+
+    async fn wait_until<F: Fn() -> bool>(timeout: Duration, condition: F) -> bool {
+        let deadline = Instant::now() + timeout;
+
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        condition()
+    }
+
+    async fn docker_text(args: &[&str]) -> String {
+        let output = docker_command().args(args).output().await.unwrap();
+
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn console_text(registry: &ServerRegistry, server_id: u64) -> String {
+        registry
+            .recent_console_messages(server_id, 1000)
+            .unwrap()
+            .iter()
+            .map(|message| message.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Runs one depot image through the real daemon: install-less boot from
+    /// `pending`, startup detection, variable substitution, console input,
+    /// daemon restart adoption, power restart and graceful stop.
+    async fn depot_image_scenario(
+        image_id: &str,
+        index: u64,
+        program_file: &str,
+        program: &str,
+        startup: &str,
+        compile_with: Option<&str>,
+    ) {
+        use crate::server_lifecycle::ServerLifecycleService;
+
+        let server_id = 987_100 + index;
+        let port = 46_100 + index;
+        let name = runtime_container_name(server_id);
+        let image = depot_image_tag(image_id);
+
+        assert!(
+            docker_command()
+                .args(["image", "inspect", &image])
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success(),
+            "build the image first: depot/tests/run.sh --keep {image_id} ({image} is missing)"
+        );
+
+        let _ = docker_command().args(["rm", "-f", &name]).output().await;
+        let volume = managed_server_volume_path(server_id).unwrap();
+        let _ = std::fs::remove_dir_all(&volume);
+        std::fs::create_dir_all(&volume).unwrap();
+        std::fs::write(volume.join(program_file), program).unwrap();
+        // The container user is not the host user: make the volume writable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&volume, std::fs::Permissions::from_mode(0o777)).unwrap();
+            std::fs::set_permissions(
+                volume.join(program_file),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+
+        // A runtime-only image (JRE) cannot compile: build with a JDK image.
+        if let Some(compiler_image) = compile_with {
+            let compiled = docker_command()
+                .args(["run", "--rm", "-v"])
+                .arg(format!("{}:/home/container", volume.display()))
+                .args(["-w", "/home/container", "--entrypoint", "javac"])
+                .arg(depot_image_tag(compiler_image))
+                .arg(program_file)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+        }
+
+        let directory = tempdir().unwrap();
+        let registry = ServerRegistry::new(directory.path().join("registry.db"));
+        registry.initialize().unwrap();
+
+        let mut server = sample_managed_server();
+        server.id = server_id;
+        server.node_id = 5;
+        server.status = "pending".to_string();
+        server.allocation.bind_ip = "127.0.0.1".to_string();
+        server.allocation.port = port;
+        server.limits.memory_mib = 512;
+        server.limits.disk_mib = 2048;
+        server.cargo.install_script = None;
+        server.cargo.install_container = None;
+        server.cargo.startup_command = startup.to_string();
+        server.cargo.config_startup = "ready-marker".to_string();
+        server.cargo.config_stop = "stop".to_string();
+        server.cargo.docker_images =
+            std::collections::BTreeMap::from([("test".to_string(), image.clone())]);
+        registry.upsert_server(&server).unwrap();
+
+        let config = {
+            let mut config = ws_test_config(5);
+            config.panel.node_id = Some(5);
+            config
+        };
+        let (_config_tx, config_rx) = watch::channel(config);
+
+        // 1. Boot from pending.
+        let cancellation = CancellationToken::new();
+        let service = ServerLifecycleService::new(config_rx.clone(), registry.clone(), cancellation.clone());
+        let handle = tokio::spawn(service.run());
+
+        let running = wait_until(Duration::from_secs(240), || {
+            registry.get_server_status(server_id).unwrap().as_deref() == Some("running")
+        })
+        .await;
+        assert!(running, "{image_id}: never became running\n{}", console_text(&registry, server_id));
+
+        let console = console_text(&registry, server_id);
+        assert!(
+            console.contains(&format!("ready-marker port={port} mem=512 ip=")),
+            "{image_id}: {{{{VAR}}}} substitution or env is wrong\n{console}"
+        );
+        assert!(console.contains("user=container"), "{image_id}: not running as the container user\n{console}");
+        assert!(console.contains("cwd=/home/container"), "{image_id}: wrong working directory\n{console}");
+        let ip = console
+            .split("ip=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_default();
+        assert!(!ip.is_empty() && ip != "user=container", "{image_id}: INTERNAL_IP is empty\n{console}");
+
+        // 2. Console input reaches the program.
+        let server = registry.get_server(server_id).unwrap().unwrap();
+        send_command_to_server(&registry, &server, "ping").await.unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || console_text(&registry, server_id).contains("got:ping")).await,
+            "{image_id}: console command was not delivered\n{}",
+            console_text(&registry, server_id)
+        );
+
+        // 3. Daemon restart: the container is adopted, not recreated.
+        let container_id = docker_text(&["inspect", "-f", "{{.Id}}", &name]).await;
+        cancellation.cancel();
+        let _ = handle.await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let cancellation = CancellationToken::new();
+        let service = ServerLifecycleService::new(config_rx.clone(), registry.clone(), cancellation.clone());
+        let handle = tokio::spawn(service.run());
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        assert_eq!(
+            docker_text(&["inspect", "-f", "{{.Id}} {{.State.Running}}", &name]).await,
+            format!("{container_id} true"),
+            "{image_id}: container was recreated by a daemon restart"
+        );
+        send_command_to_server(&registry, &server, "after-restart").await.unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || console_text(&registry, server_id).contains("got:after-restart")).await,
+            "{image_id}: console is dead after a daemon restart"
+        );
+
+        // 4. Power restart through the websocket code path.
+        let server = registry.get_server(server_id).unwrap().unwrap();
+        apply_power_signal(&registry, &server, PowerSignal::Restart).await.unwrap();
+        let restarted = wait_until(Duration::from_secs(240), || {
+            registry.get_server_status(server_id).unwrap().as_deref() == Some("running")
+                && console_text(&registry, server_id).matches("ready-marker").count() >= 2
+        })
+        .await;
+        assert!(restarted, "{image_id}: restart did not come back\n{}", console_text(&registry, server_id));
+
+        // 5. Graceful stop: the "stop" command ends the program.
+        let server = registry.get_server(server_id).unwrap().unwrap();
+        apply_power_signal(&registry, &server, PowerSignal::Stop).await.unwrap();
+        let stopped = wait_until(Duration::from_secs(60), || {
+            registry.get_server_status(server_id).unwrap().as_deref() == Some("offline")
+        })
+        .await;
+        assert!(stopped, "{image_id}: stop did not complete\n{}", console_text(&registry, server_id));
+        assert!(console_text(&registry, server_id).contains("got:stop"), "{image_id}: graceful stop command was not delivered");
+        assert!(
+            docker_text(&["ps", "-aq", "--filter", &format!("name=^{name}$")]).await.is_empty(),
+            "{image_id}: container still exists after stop"
+        );
+
+        cancellation.cancel();
+        let _ = handle.await;
+        let _ = docker_command().args(["rm", "-f", &name]).output().await;
+        let _ = std::fs::remove_dir_all(&volume);
+    }
+
+    /// The real thing: the Paper catalog entry (install script run in the depot
+    /// installer image, then the server booted on the depot Java image) driven
+    /// by the daemon, with console input and a graceful stop.
+    /// Needs internet access, `installer-debian` and `java-25-jre` built with
+    /// `depot/tests/run.sh --keep`.
+    #[tokio::test]
+    #[ignore = "requires docker, internet and depot images"]
+    async fn depot_minecraft_paper_installs_boots_and_stops_under_skyportd() {
+        use crate::server_lifecycle::ServerLifecycleService;
+        use crate::server_registry::ManagedServerVariable;
+
+        let server_id = 987_200;
+        let name = runtime_container_name(server_id);
+        let install_image = "depot-test/installer-debian:linux-amd64".to_string();
+        let runtime_image = depot_image_tag("java-25-jre");
+
+        for image in [&install_image, &runtime_image] {
+            assert!(
+                docker_command()
+                    .args(["image", "inspect", image])
+                    .output()
+                    .await
+                    .unwrap()
+                    .status
+                    .success(),
+                "{image} is missing: build it with depot/tests/run.sh --keep"
+            );
+        }
+
+        let install_script = std::fs::read_to_string(
+            project_root().unwrap().join("../depot/tests/e2e/minecraft-paper.install.sh"),
+        )
+        .expect("the depot e2e install script");
+
+        let _ = docker_command().args(["rm", "-f", &name]).output().await;
+        let volume = managed_server_volume_path(server_id).unwrap();
+        let _ = std::fs::remove_dir_all(&volume);
+
+        let directory = tempdir().unwrap();
+        let registry = ServerRegistry::new(directory.path().join("registry.db"));
+        registry.initialize().unwrap();
+
+        let variable = |env: &str, default: &str| ManagedServerVariable {
+            name: env.to_string(),
+            description: String::new(),
+            env_variable: env.to_string(),
+            default_value: default.to_string(),
+            user_viewable: true,
+            user_editable: true,
+            rules: "required".to_string(),
+            field_type: "text".to_string(),
+        };
+
+        let mut server = sample_managed_server();
+        server.id = server_id;
+        server.node_id = 5;
+        server.status = "pending".to_string();
+        server.allocation.bind_ip = "127.0.0.1".to_string();
+        server.allocation.port = 46_200;
+        server.limits.memory_mib = 1536;
+        server.limits.disk_mib = 4096;
+        server.cargo.startup_command = "java -Xms128M -Xmx{{SERVER_MEMORY}}M -Dterminal.jline=false -Dterminal.ansi=true -jar {{SERVER_JARFILE}}".to_string();
+        server.cargo.config_startup = r#"{"done":")! For help, type"}"#.to_string();
+        server.cargo.config_stop = "stop".to_string();
+        server.cargo.install_container = Some(install_image);
+        server.cargo.install_entrypoint = Some("bash".to_string());
+        server.cargo.install_script = Some(install_script);
+        server.cargo.docker_images =
+            std::collections::BTreeMap::from([("Java 25".to_string(), runtime_image)]);
+        server.cargo.variables = vec![
+            variable("SERVER_JARFILE", "server.jar"),
+            variable("MINECRAFT_VERSION", "latest"),
+            variable("BUILD_NUMBER", "latest"),
+        ];
+        registry.upsert_server(&server).unwrap();
+
+        let config = {
+            let mut config = ws_test_config(5);
+            config.panel.node_id = Some(5);
+            config
+        };
+        let (_config_tx, config_rx) = watch::channel(config);
+        let cancellation = CancellationToken::new();
+        let service = ServerLifecycleService::new(config_rx, registry.clone(), cancellation.clone());
+        let handle = tokio::spawn(service.run());
+
+        let running = wait_until(Duration::from_secs(900), || {
+            matches!(
+                registry.get_server_status(server_id).unwrap().as_deref(),
+                Some("running") | Some("install_failed")
+            )
+        })
+        .await;
+        let status = registry.get_server_status(server_id).unwrap();
+        let console = console_text(&registry, server_id);
+        assert!(
+            running && status.as_deref() == Some("running"),
+            "paper did not reach running (status {status:?})\n{}",
+            &console[console.len().saturating_sub(4000)..]
+        );
+        assert!(console.contains("Installation completed successfully."));
+        assert!(console.contains("Startup matcher detected"));
+        assert!(volume.join("server.jar").exists());
+
+        // Console command round trip against the real server.
+        let server = registry.get_server(server_id).unwrap().unwrap();
+        send_command_to_server(&registry, &server, "list").await.unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                console_text(&registry, server_id).contains("players online")
+                    || console_text(&registry, server_id).contains("of a max")
+            })
+            .await,
+            "the Paper server did not answer `list`\n{}",
+            console_text(&registry, server_id)
+        );
+
+        // Graceful stop through the configured stop command.
+        apply_power_signal(&registry, &server, PowerSignal::Stop).await.unwrap();
+        assert!(
+            wait_until(Duration::from_secs(120), || {
+                registry.get_server_status(server_id).unwrap().as_deref() == Some("offline")
+            })
+            .await,
+            "the Paper server did not stop\n{}",
+            console_text(&registry, server_id)
+        );
+
+        cancellation.cancel();
+        let _ = handle.await;
+        let _ = docker_command().args(["rm", "-f", &name]).output().await;
+        let _ = std::fs::remove_dir_all(&volume);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker and depot images"]
+    async fn depot_os_alpine_runs_under_skyportd() {
+        depot_image_scenario("os-alpine", 0, "run.sh", SH_PROGRAM, "sh run.sh {{SERVER_PORT}}", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker and depot images"]
+    async fn depot_os_debian_runs_under_skyportd() {
+        depot_image_scenario("os-debian", 1, "run.sh", SH_PROGRAM, "bash run.sh {{SERVER_PORT}}", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker and depot images"]
+    async fn depot_nodejs_runs_under_skyportd() {
+        depot_image_scenario("nodejs-22", 2, "run.js", NODE_PROGRAM, "node run.js {{SERVER_PORT}}", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker and depot images"]
+    async fn depot_python_runs_under_skyportd() {
+        depot_image_scenario("python-3.12", 3, "run.py", PYTHON_PROGRAM, "python run.py {{SERVER_PORT}}", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker and depot images"]
+    async fn depot_go_runs_under_skyportd() {
+        depot_image_scenario("go-1.24", 4, "run.go", GO_PROGRAM, "go run run.go {{SERVER_PORT}}", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker and depot images"]
+    async fn depot_java_runs_under_skyportd() {
+        depot_image_scenario(
+            "java-21-jre",
+            5,
+            "Run.java",
+            JAVA_PROGRAM,
+            "java -Xmx{{SERVER_MEMORY}}M -cp . Run {{SERVER_PORT}}",
+            Some("java-21"),
+        )
+        .await;
+    }
 
     #[test]
     fn install_console_messages_use_install_output_events() {

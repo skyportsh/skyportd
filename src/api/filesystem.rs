@@ -403,16 +403,13 @@ pub(super) fn extract_archive(
     Ok(())
 }
 
-pub(super) fn upload_file(
+/// Validates an upload request and returns the path the file will be written
+/// to. Nothing is written yet so the caller can stream the body to disk.
+pub(super) fn prepare_upload_target(
     server: &ManagedServerRecord,
     requested_path: &str,
     name: &str,
-    bytes: &[u8],
-) -> Result<()> {
-    if bytes.len() > 1024 * 1024 * 1024 {
-        bail!("Uploaded files may not be larger than 1 GB.");
-    }
-
+) -> Result<PathBuf> {
     let volume_path = ensure_server_volume(server)?;
     let directory_path = resolve_destination_directory(&volume_path, requested_path)?;
     let file_path = directory_path.join(validate_entry_name(name)?);
@@ -421,10 +418,7 @@ pub(super) fn upload_file(
         bail!("A file with that name already exists.");
     }
 
-    fs::write(&file_path, bytes)
-        .with_context(|| format!("failed to write {}", file_path.display()))?;
-
-    Ok(())
+    Ok(file_path)
 }
 
 pub(super) fn resolve_destination_directory(

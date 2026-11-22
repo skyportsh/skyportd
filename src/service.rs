@@ -49,7 +49,7 @@ impl HeartbeatService {
     pub async fn run(mut self) -> Result<()> {
         let mut interval = time::interval(self.config.daemon.tick_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
 
         info!(
             tick_interval_seconds = self.config.daemon.tick_interval.as_secs(),
@@ -142,6 +142,7 @@ impl HeartbeatService {
                     "removing orphaned server not found on panel"
                 );
                 let _ = self.server_registry.delete_server(server.id);
+                crate::api::forget_resource_snapshot(server.id);
             }
         }
 

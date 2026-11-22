@@ -138,8 +138,14 @@ pub(super) async fn handle_backup(
 
             // Check disk quota before restoring
             let disk_limit = (server.limits.disk_mib as u64) * 1024 * 1024;
-            let uncompressed_size = gzip_uncompressed_size(&backup_path)
-                .map_err(|e| internal_error(anyhow::anyhow!("failed to check backup size: {e}")))?;
+            let uncompressed_size = {
+                let backup_path = backup_path.clone();
+
+                tokio::task::spawn_blocking(move || gzip_uncompressed_size(&backup_path))
+                    .await
+                    .map_err(|e| internal_error(anyhow::anyhow!("backup size check was interrupted: {e}")))?
+                    .map_err(|e| internal_error(anyhow::anyhow!("failed to check backup size: {e}")))?
+            };
 
             if uncompressed_size > disk_limit {
                 let msg = format!(
@@ -165,21 +171,27 @@ pub(super) async fn handle_backup(
                 ));
             }
 
-            // Clear the volume directory
+            // Clear the volume directory (off the async runtime: it can hold
+            // hundreds of thousands of files).
             if volume_path.exists() {
-                for entry in std::fs::read_dir(&volume_path).map_err(|e| {
-                    internal_error(anyhow::anyhow!("failed to read volume: {e}"))
-                })? {
-                    let entry = entry.map_err(|e| {
-                        internal_error(anyhow::anyhow!("failed to read entry: {e}"))
-                    })?;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let _ = std::fs::remove_dir_all(&path);
-                    } else {
-                        let _ = std::fs::remove_file(&path);
+                let volume_path = volume_path.clone();
+
+                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    for entry in std::fs::read_dir(&volume_path)? {
+                        let path = entry?.path();
+
+                        if path.is_dir() {
+                            let _ = std::fs::remove_dir_all(&path);
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
-                }
+
+                    Ok(())
+                })
+                .await
+                .map_err(|e| internal_error(anyhow::anyhow!("volume cleanup was interrupted: {e}")))?
+                .map_err(|e| internal_error(anyhow::anyhow!("failed to clear volume: {e}")))?;
             }
 
             // Extract the backup
@@ -327,7 +339,7 @@ pub(super) async fn notify_backup_status(
         .uuid
         .as_str();
 
-    reqwest::Client::new()
+    crate::http::client()
         .post(format!("{panel_url}/api/daemon/servers/{server_id}/runtime"))
         .bearer_auth(daemon_secret)
         .json(&serde_json::json!({

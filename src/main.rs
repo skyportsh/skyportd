@@ -1,6 +1,8 @@
 mod api;
 mod app;
 mod config;
+mod docker;
+mod http;
 mod configuration;
 mod logging;
 mod server_lifecycle;

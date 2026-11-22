@@ -185,7 +185,7 @@ async fn authenticate_sftp(
         .as_deref()
         .context("daemon not enrolled")?;
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let response = client
         .post(format!("{panel_url}/api/daemon/sftp/auth"))
         .bearer_auth(callback_token)

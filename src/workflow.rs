@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::api::{container_is_running, docker_command, runtime_container_name, send_command_to_server};
+use crate::api::{container_is_running, runtime_container_name, send_command_to_server};
+use crate::docker::{DockerOutput, docker_command};
 use crate::config::DaemonConfig;
 use crate::server_registry::{ManagedServerRecord, ManagedServerWorkflow, ManagedServerWorkflowStep, ServerRegistry};
 
@@ -455,7 +456,7 @@ async fn execute_action(
                     let _ = docker_command()
                         .arg("kill")
                         .arg(&container_name)
-                        .output()
+                        .docker_output()
                         .await;
                     registry.set_server_runtime(server.id, "offline", None, None)?;
                 }

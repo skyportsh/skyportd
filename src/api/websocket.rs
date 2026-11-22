@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use axum::extract::ws::{Message, WebSocket};
 use ring::hmac;
 use serde_json::{Value, json};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::server_registry::{ConsoleMessageRecord, ManagedServerRecord, ServerRegistry};
@@ -55,28 +56,63 @@ pub(super) async fn handle_server_ws(
     let mut last_id = 0_u64;
     let mut last_status: Option<String> = None;
 
-    let mut console_interval = time::interval(Duration::from_millis(100));
-    console_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Live console lines are pushed by the registry; nothing is polled.
+    let mut console_rx = registry.subscribe_console(server_id);
 
     let mut stats_interval = time::interval(Duration::from_secs(2));
     stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut status_interval = time::interval(Duration::from_millis(500));
-    status_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Status changes are pushed by the registry; nothing is polled.
+    let mut status_rx = match registry.subscribe_status(server_id) {
+        Ok(receiver) => receiver,
+        Err(_) => return,
+    };
 
     loop {
         tokio::select! {
-            _ = console_interval.tick(), if authenticated => {
-                let messages = match registry.console_messages_since(server_id, last_id, 200) {
-                    Ok(messages) => messages,
-                    Err(_) => break,
-                };
+            message = console_rx.recv(), if authenticated => {
+                match message {
+                    Ok(message) => {
+                        if message.id > last_id {
+                            last_id = message.id;
 
-                for message in messages {
-                    last_id = message.id;
-                    if send_console_event(&mut socket, &message).await.is_err() {
-                        return;
+                            if send_console_event(&mut socket, &message).await.is_err() {
+                                return;
+                            }
+                        }
                     }
+                    Err(RecvError::Lagged(_)) => {
+                        // The client was too slow: catch up from the buffer.
+                        let messages = match registry.console_messages_since(server_id, last_id, 1000) {
+                            Ok(messages) => messages,
+                            Err(_) => return,
+                        };
+
+                        // Lines older than the buffer are gone: say so instead of
+                        // silently showing a console with a hole in it.
+                        if let Some(first) = messages.first() {
+                            let skipped = first.id.saturating_sub(last_id + 1);
+
+                            if skipped > 0 {
+                                let notice = format!(
+                                    "{skipped} console lines were skipped because the connection was too slow."
+                                );
+
+                                if send_ws_event(&mut socket, "daemon message", vec![Value::String(notice)]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+
+                        for message in messages {
+                            last_id = message.id;
+
+                            if send_console_event(&mut socket, &message).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
                 }
             }
             _ = stats_interval.tick(), if authenticated && stats_subscribed => {
@@ -89,20 +125,24 @@ pub(super) async fn handle_server_ws(
                     return;
                 }
             }
-            _ = status_interval.tick(), if authenticated => {
-                let server = match registry.get_server(server_id) {
-                    Ok(Some(server)) => server,
-                    _ => return,
+            changed = status_rx.changed(), if authenticated => {
+                // The channel closes when the server is deleted.
+                if changed.is_err() {
+                    return;
+                }
+
+                let Some(status) = status_rx.borrow_and_update().clone() else {
+                    continue;
                 };
 
-                if last_status.as_deref() != Some(server.status.as_str()) {
-                    let previous_status = last_status.replace(server.status.clone());
+                if last_status.as_deref() != Some(status.as_str()) {
+                    let previous_status = last_status.replace(status.clone());
 
-                    if send_status_event(&mut socket, &server.status).await.is_err() {
+                    if send_status_event(&mut socket, &status).await.is_err() {
                         return;
                     }
 
-                    if send_install_state_event(&mut socket, previous_status.as_deref(), &server.status).await.is_err() {
+                    if send_install_state_event(&mut socket, previous_status.as_deref(), &status).await.is_err() {
                         return;
                     }
                 }
@@ -142,6 +182,13 @@ pub(super) async fn handle_server_ws(
                                         return;
                                     }
 
+                                    // Subscribe first so a change right after the read
+                                    // below is still delivered.
+                                    match registry.subscribe_status(server_id) {
+                                        Ok(receiver) => status_rx = receiver,
+                                        Err(_) => return,
+                                    }
+
                                     if let Ok(Some(server)) = registry.get_server(server_id) {
                                         last_status = Some(server.status.clone());
 
@@ -150,11 +197,11 @@ pub(super) async fn handle_server_ws(
                                         }
                                     }
 
-                                    if let Ok(backlog) = registry.console_messages_since(server_id, 0, 200) {
-                                        for message in backlog {
-                                            last_id = last_id.max(message.id);
-                                        }
-                                    }
+                                    // Start from the live edge: history is only sent when
+                                    // the client asks for it with "send logs". (Replaying
+                                    // from id 0 used to stream the whole history.)
+                                    console_rx = registry.subscribe_console(server_id);
+                                    last_id = registry.latest_console_id(server_id);
                                 }
                                 Err(error) => {
                                     if send_ws_event(&mut socket, "jwt error", vec![Value::String(error.to_string())]).await.is_err() {

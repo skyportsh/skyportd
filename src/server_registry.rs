@@ -1,17 +1,220 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{broadcast, watch};
 
 use crate::config::project_root;
+
+/// Number of console lines kept in memory for each server.
+const CONSOLE_BUFFER_LINES: usize = 1000;
+/// Capacity of the live console broadcast channel of each server.
+const CONSOLE_BROADCAST_CAPACITY: usize = 1024;
+/// Maximum size in bytes of a single stored console line.
+const CONSOLE_MAX_LINE_BYTES: usize = 8 * 1024;
+/// Hard bound on the memory held by the console of one server, whatever the
+/// line length. Older lines are evicted first.
+const CONSOLE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+/// Sustained console ingestion rate accepted per server (lines per second).
+const CONSOLE_RATE_LINES_PER_SECOND: f64 = 5_000.0;
+/// Burst of lines accepted before the rate limit kicks in.
+const CONSOLE_RATE_BURST_LINES: f64 = 10_000.0;
+/// How long a SQLite connection waits for a competing writer.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct ServerRegistry {
     db_path: PathBuf,
+    console: Arc<ConsoleHub>,
+}
+
+/// In-memory console storage shared by every clone of the registry.
+///
+/// Console output used to be written to SQLite one row per line, which grew
+/// without bound and made every log line a synchronous database write. The
+/// hub keeps a bounded ring buffer per server and fans live lines out to
+/// websocket clients through a broadcast channel.
+#[derive(Debug, Default)]
+pub struct ConsoleHub {
+    servers: Mutex<HashMap<u64, ConsoleBuffer>>,
+}
+
+#[derive(Debug)]
+struct ConsoleBuffer {
+    next_id: u64,
+    lines: VecDeque<ConsoleMessageRecord>,
+    bytes: usize,
+    sender: broadcast::Sender<ConsoleMessageRecord>,
+    /// Latest known status of the server, pushed to websocket clients.
+    status: watch::Sender<Option<String>>,
+    /// Token bucket protecting the daemon from a server flooding its console.
+    tokens: f64,
+    refilled_at: Instant,
+    dropped_lines: u64,
+}
+
+impl ConsoleBuffer {
+    fn new() -> Self {
+        let (sender, _) = broadcast::channel(CONSOLE_BROADCAST_CAPACITY);
+        let (status, _) = watch::channel(None);
+
+        Self {
+            next_id: 1,
+            lines: VecDeque::new(),
+            bytes: 0,
+            sender,
+            status,
+            tokens: CONSOLE_RATE_BURST_LINES,
+            refilled_at: Instant::now(),
+            dropped_lines: 0,
+        }
+    }
+
+    /// Token bucket: returns whether one more line may be accepted at `now`.
+    fn admit(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled_at).as_secs_f64();
+
+        self.refilled_at = now;
+        self.tokens =
+            (self.tokens + elapsed * CONSOLE_RATE_LINES_PER_SECOND).min(CONSOLE_RATE_BURST_LINES);
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push(&mut self, server_id: u64, source: String, message: String, created_at: String) {
+        let record = ConsoleMessageRecord {
+            id: self.next_id,
+            server_id,
+            source,
+            message,
+            created_at,
+        };
+
+        self.next_id += 1;
+        self.bytes += record.message.len();
+        self.lines.push_back(record.clone());
+
+        // Bound both the number of lines and the memory they use.
+        while self.lines.len() > CONSOLE_BUFFER_LINES
+            || (self.bytes > CONSOLE_BUFFER_BYTES && self.lines.len() > 1)
+        {
+            if let Some(evicted) = self.lines.pop_front() {
+                self.bytes = self.bytes.saturating_sub(evicted.message.len());
+            }
+        }
+
+        // A send error only means that nobody is listening right now.
+        let _ = self.sender.send(record);
+    }
+}
+
+impl ConsoleHub {
+    fn with_buffer<T>(&self, server_id: u64, action: impl FnOnce(&mut ConsoleBuffer) -> T) -> T {
+        let mut servers = self
+            .servers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        action(servers.entry(server_id).or_insert_with(ConsoleBuffer::new))
+    }
+
+    fn append(&self, server_id: u64, source: &str, message: &str) {
+        self.append_at(server_id, source, message, Instant::now());
+    }
+
+    fn append_at(&self, server_id: u64, source: &str, message: &str, now: Instant) {
+        let message = truncate_console_line(message);
+        let source = source.to_string();
+        let created_at = format_utc_timestamp(SystemTime::now());
+
+        self.with_buffer(server_id, |buffer| {
+            if !buffer.admit(now) {
+                buffer.dropped_lines += 1;
+                return;
+            }
+
+            // Tell readers once that lines were lost to the rate limit.
+            if buffer.dropped_lines > 0 {
+                let notice = format!(
+                    "{} console lines were dropped because the server printed too fast.",
+                    buffer.dropped_lines
+                );
+                buffer.dropped_lines = 0;
+                buffer.push(server_id, "system".to_string(), notice, created_at.clone());
+            }
+
+            buffer.push(server_id, source, message, created_at);
+        });
+    }
+
+    fn publish_status(&self, server_id: u64, status: &str) {
+        self.with_buffer(server_id, |buffer| {
+            buffer.status.send_replace(Some(status.to_string()));
+        });
+    }
+
+    fn remove(&self, server_id: u64) {
+        let mut servers = self
+            .servers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        servers.remove(&server_id);
+    }
+}
+
+fn truncate_console_line(message: &str) -> String {
+    if message.len() <= CONSOLE_MAX_LINE_BYTES {
+        return message.to_string();
+    }
+
+    let mut end = CONSOLE_MAX_LINE_BYTES;
+
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}…", &message[..end])
+}
+
+/// Formats a timestamp as `YYYY-MM-DD HH:MM:SS` in UTC.
+fn format_utc_timestamp(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default() as i64;
+    let days = seconds.div_euclid(86_400);
+    let remainder = seconds.rem_euclid(86_400);
+
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        remainder / 3_600,
+        remainder % 3_600 / 60,
+        remainder % 60
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,7 +340,10 @@ pub struct ConsoleMessageRecord {
 
 impl ServerRegistry {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            console: Arc::new(ConsoleHub::default()),
+        }
     }
 
     pub fn new_default() -> Result<Self> {
@@ -201,18 +407,35 @@ impl ServerRegistry {
             );
             CREATE INDEX IF NOT EXISTS idx_servers_node_id ON servers (node_id);
             CREATE INDEX IF NOT EXISTS idx_servers_status ON servers (status);
-            CREATE TABLE IF NOT EXISTS server_console_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_id INTEGER NOT NULL,
-                source TEXT NOT NULL,
-                message TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_server_console_messages_server_id ON server_console_messages (server_id, id);
             "#,
         )?;
 
         self.ensure_server_columns(&connection)?;
+        self.drop_legacy_console_table(&connection)?;
+
+        Ok(())
+    }
+
+    /// Console output now lives in memory. Older databases still carry the
+    /// unbounded `server_console_messages` table, which is dropped (and the
+    /// file compacted) once.
+    fn drop_legacy_console_table(&self, connection: &Connection) -> Result<()> {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'server_console_messages')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if exists {
+            connection.execute_batch("DROP TABLE server_console_messages;")?;
+
+            // Compacting needs temporary disk space up to the size of the
+            // database and can take a while; failing to do it only means the
+            // file keeps its size, so it must never stop the daemon.
+            if let Err(error) = connection.execute_batch("VACUUM;") {
+                tracing::warn!(error = %error, "could not compact the registry database");
+            }
+        }
 
         Ok(())
     }
@@ -337,6 +560,7 @@ impl ServerRegistry {
                 last_error,
             ],
         )?;
+        self.console.publish_status(server.id, &status);
 
         Ok(())
     }
@@ -369,12 +593,9 @@ impl ServerRegistry {
 
     pub fn delete_server(&self, server_id: u64) -> Result<bool> {
         let connection = self.open()?;
-        connection.execute(
-            "DELETE FROM server_console_messages WHERE server_id = ?1",
-            params![server_id],
-        )?;
         let deleted =
             connection.execute("DELETE FROM servers WHERE id = ?1", params![server_id])?;
+        self.console.remove(server_id);
 
         Ok(deleted > 0)
     }
@@ -391,21 +612,48 @@ impl ServerRegistry {
             "UPDATE servers SET status = ?1, container_id = ?2, last_error = ?3 WHERE id = ?4",
             params![status, container_id, last_error, server_id],
         )?;
+        self.console.publish_status(server_id, status);
 
         Ok(())
     }
 
+    /// Subscribes to status changes of a server. The channel is seeded from
+    /// the database the first time, so a new subscriber always sees a value.
+    pub fn subscribe_status(&self, server_id: u64) -> Result<watch::Receiver<Option<String>>> {
+        let receiver = self
+            .console
+            .with_buffer(server_id, |buffer| buffer.status.subscribe());
+
+        if receiver.borrow().is_none() {
+            if let Some(status) = self.get_server_status(server_id)? {
+                self.console.with_buffer(server_id, |buffer| {
+                    // Never overwrite a status published in the meantime.
+                    buffer.status.send_if_modified(|current| {
+                        if current.is_none() {
+                            *current = Some(status);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                });
+            }
+        }
+
+        Ok(self
+            .console
+            .with_buffer(server_id, |buffer| buffer.status.subscribe()))
+    }
+
+    /// Appends a line to the in-memory console of a server and notifies any
+    /// live subscriber. This never touches the database and cannot fail.
     pub fn append_console_message(
         &self,
         server_id: u64,
         source: &str,
         message: &str,
     ) -> Result<()> {
-        let connection = self.open()?;
-        connection.execute(
-            "INSERT INTO server_console_messages (server_id, source, message) VALUES (?1, ?2, ?3)",
-            params![server_id, source, message],
-        )?;
+        self.console.append(server_id, source, message);
 
         Ok(())
     }
@@ -416,32 +664,15 @@ impl ServerRegistry {
         last_id: u64,
         limit: u64,
     ) -> Result<Vec<ConsoleMessageRecord>> {
-        let connection = self.open()?;
-        let mut statement = connection.prepare(
-            r#"
-            SELECT id, server_id, source, message, created_at
-            FROM server_console_messages
-            WHERE server_id = ?1 AND id > ?2
-            ORDER BY id ASC
-            LIMIT ?3
-            "#,
-        )?;
-        let rows = statement.query_map(params![server_id, last_id, limit], |row| {
-            Ok(ConsoleMessageRecord {
-                id: row.get(0)?,
-                server_id: row.get(1)?,
-                source: row.get(2)?,
-                message: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-        let mut messages = Vec::new();
-
-        for row in rows {
-            messages.push(row?);
-        }
-
-        Ok(messages)
+        Ok(self.console.with_buffer(server_id, |buffer| {
+            buffer
+                .lines
+                .iter()
+                .filter(|message| message.id > last_id)
+                .take(limit as usize)
+                .cloned()
+                .collect()
+        }))
     }
 
     pub fn recent_console_messages(
@@ -449,41 +680,65 @@ impl ServerRegistry {
         server_id: u64,
         limit: u64,
     ) -> Result<Vec<ConsoleMessageRecord>> {
+        Ok(self.console.with_buffer(server_id, |buffer| {
+            let skip = buffer.lines.len().saturating_sub(limit as usize);
+
+            buffer.lines.iter().skip(skip).cloned().collect()
+        }))
+    }
+
+    /// Identifier of the newest console line of a server, or 0 when empty.
+    pub fn latest_console_id(&self, server_id: u64) -> u64 {
+        self.console
+            .with_buffer(server_id, |buffer| buffer.next_id.saturating_sub(1))
+    }
+
+    /// Subscribes to the live console output of a server.
+    pub fn subscribe_console(&self, server_id: u64) -> broadcast::Receiver<ConsoleMessageRecord> {
+        self.console
+            .with_buffer(server_id, |buffer| buffer.sender.subscribe())
+    }
+
+    /// Cheap status lookup that avoids deserializing the whole record.
+    pub fn get_server_status(&self, server_id: u64) -> Result<Option<String>> {
         let connection = self.open()?;
-        let mut statement = connection.prepare(
-            r#"
-            SELECT id, server_id, source, message, created_at
-            FROM (
-                SELECT id, server_id, source, message, created_at
-                FROM server_console_messages
-                WHERE server_id = ?1
-                ORDER BY id DESC
-                LIMIT ?2
+
+        connection
+            .query_row(
+                "SELECT status FROM servers WHERE id = ?1",
+                params![server_id],
+                |row| row.get(0),
             )
-            ORDER BY id ASC
-            "#,
-        )?;
-        let rows = statement.query_map(params![server_id, limit], |row| {
-            Ok(ConsoleMessageRecord {
-                id: row.get(0)?,
-                server_id: row.get(1)?,
-                source: row.get(2)?,
-                message: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-        let mut messages = Vec::new();
+            .optional()
+            .context("failed to fetch server status from registry")
+    }
+
+    /// Lists `(id, status)` for every server of a node without decoding the
+    /// cargo definition of each one.
+    pub fn list_server_statuses_for_node(&self, node_id: u64) -> Result<Vec<(u64, String)>> {
+        let connection = self.open()?;
+        let mut statement =
+            connection.prepare("SELECT id, status FROM servers WHERE node_id = ?1 ORDER BY id ASC")?;
+        let rows = statement.query_map(params![node_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut servers = Vec::new();
 
         for row in rows {
-            messages.push(row?);
+            servers.push(row?);
         }
 
-        Ok(messages)
+        Ok(servers)
     }
 
     fn open(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open {}", self.db_path.display()))
+        let connection = Connection::open(&self.db_path)
+            .with_context(|| format!("failed to open {}", self.db_path.display()))?;
+
+        // Wait for a competing writer instead of failing with SQLITE_BUSY.
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        // WAL is crash safe with NORMAL and avoids an fsync on every commit.
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+
+        Ok(connection)
     }
 
     fn ensure_server_columns(&self, connection: &Connection) -> Result<()> {
@@ -682,6 +937,283 @@ where
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn sample_server_record() -> ManagedServerRecord {
+        ManagedServerRecord {
+            id: 11,
+            node_id: 1,
+            name: "Sample".to_string(),
+            status: "offline".to_string(),
+            volume_path: "volumes/11".to_string(),
+            created_at: "2026-04-06T12:00:00Z".to_string(),
+            updated_at: "2026-04-06T12:00:00Z".to_string(),
+            docker_image: None,
+            container_id: None,
+            last_error: None,
+            user: ManagedServerUser {
+                id: 1,
+                name: "Jane".to_string(),
+                email: "jane@example.com".to_string(),
+            },
+            limits: ManagedServerLimits {
+                memory_mib: 512,
+                cpu_limit: 100,
+                disk_mib: 1024,
+            },
+            cargo: ManagedServerCargo {
+                id: 1,
+                name: "Paper".to_string(),
+                slug: "paper".to_string(),
+                source_type: "custom".to_string(),
+                startup_command: "java".to_string(),
+                config_files: "{}".to_string(),
+                config_startup: "{}".to_string(),
+                config_logs: "{}".to_string(),
+                config_stop: "stop".to_string(),
+                install_script: None,
+                install_container: None,
+                install_entrypoint: None,
+                features: vec![],
+                docker_images: BTreeMap::new(),
+                file_denylist: vec![],
+                file_hidden_list: vec![],
+                requires_privileged: false,
+                variables: vec![],
+                definition: serde_json::json!({}),
+            },
+            allocation: ManagedServerAllocation {
+                id: 1,
+                bind_ip: "0.0.0.0".to_string(),
+                port: 25565,
+                ip_alias: None,
+            },
+            firewall_rules: vec![],
+            interconnects: vec![],
+            workflows: vec![],
+        }
+    }
+
+    fn test_registry() -> (tempfile::TempDir, ServerRegistry) {
+        let directory = tempdir().unwrap();
+        let registry = ServerRegistry::new(directory.path().join("registry.db"));
+        registry.initialize().unwrap();
+
+        (directory, registry)
+    }
+
+    #[test]
+    fn console_keeps_only_the_most_recent_lines() {
+        let (_directory, registry) = test_registry();
+
+        for index in 0..(CONSOLE_BUFFER_LINES + 50) {
+            registry
+                .append_console_message(1, "stdout", &format!("line {index}"))
+                .unwrap();
+        }
+
+        let all = registry.recent_console_messages(1, u64::MAX).unwrap();
+
+        assert_eq!(all.len(), CONSOLE_BUFFER_LINES);
+        assert_eq!(all.first().unwrap().message, "line 50");
+        assert_eq!(
+            all.last().unwrap().message,
+            format!("line {}", CONSOLE_BUFFER_LINES + 49)
+        );
+        assert_eq!(
+            registry.latest_console_id(1),
+            (CONSOLE_BUFFER_LINES + 50) as u64
+        );
+    }
+
+    #[test]
+    fn console_since_returns_only_newer_lines_in_order() {
+        let (_directory, registry) = test_registry();
+
+        for index in 1..=10 {
+            registry
+                .append_console_message(7, "stdout", &format!("line {index}"))
+                .unwrap();
+        }
+
+        let since = registry.console_messages_since(7, 6, 100).unwrap();
+
+        assert_eq!(
+            since.iter().map(|m| m.message.as_str()).collect::<Vec<_>>(),
+            ["line 7", "line 8", "line 9", "line 10"]
+        );
+        assert_eq!(registry.console_messages_since(7, 6, 2).unwrap().len(), 2);
+        assert!(registry.console_messages_since(7, 10, 100).unwrap().is_empty());
+        assert!(registry.console_messages_since(999, 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn console_is_isolated_between_servers() {
+        let (_directory, registry) = test_registry();
+
+        registry.append_console_message(1, "stdout", "one").unwrap();
+        registry.append_console_message(2, "stdout", "two").unwrap();
+
+        assert_eq!(registry.recent_console_messages(1, 10).unwrap().len(), 1);
+        assert_eq!(registry.recent_console_messages(2, 10).unwrap()[0].message, "two");
+    }
+
+    #[test]
+    fn console_lines_are_truncated_on_a_char_boundary() {
+        let (_directory, registry) = test_registry();
+        let long = "é".repeat(CONSOLE_MAX_LINE_BYTES);
+
+        registry.append_console_message(1, "stdout", &long).unwrap();
+
+        let stored = &registry.recent_console_messages(1, 1).unwrap()[0].message;
+
+        assert!(stored.len() <= CONSOLE_MAX_LINE_BYTES + '…'.len_utf8());
+        assert!(stored.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn console_subscribers_receive_live_lines() {
+        let (_directory, registry) = test_registry();
+        let mut receiver = registry.subscribe_console(3);
+
+        registry.append_console_message(3, "stdout", "hello").unwrap();
+
+        let message = receiver.recv().await.unwrap();
+
+        assert_eq!(message.message, "hello");
+        assert_eq!(message.id, 1);
+    }
+
+    #[test]
+    fn console_memory_is_bounded_in_bytes_not_only_in_lines() {
+        let (_directory, registry) = test_registry();
+        let line = "x".repeat(CONSOLE_MAX_LINE_BYTES);
+
+        // 400 lines of 8 KiB would be 3.2 MiB: the byte cap must evict.
+        for _ in 0..400 {
+            registry.append_console_message(1, "stdout", &line).unwrap();
+        }
+
+        let stored = registry.recent_console_messages(1, u64::MAX).unwrap();
+        let bytes: usize = stored.iter().map(|message| message.message.len()).sum();
+
+        assert!(bytes <= CONSOLE_BUFFER_BYTES, "{bytes} bytes kept");
+        assert!(stored.len() < 400);
+        assert_eq!(registry.latest_console_id(1), 400);
+        assert_eq!(stored.last().unwrap().id, 400);
+    }
+
+    #[test]
+    fn console_ingestion_is_rate_limited_and_reports_dropped_lines() {
+        let (_directory, registry) = test_registry();
+        let start = Instant::now();
+
+        // A flood at a single instant: only the burst is accepted.
+        for index in 0..(CONSOLE_RATE_BURST_LINES as usize + 500) {
+            registry
+                .console
+                .append_at(1, "stdout", &format!("line {index}"), start);
+        }
+
+        assert_eq!(
+            registry.latest_console_id(1),
+            CONSOLE_RATE_BURST_LINES as u64,
+            "lines beyond the burst must be dropped"
+        );
+
+        // Later the bucket has refilled: one notice, then the line.
+        registry
+            .console
+            .append_at(1, "stdout", "after flood", start + Duration::from_secs(1));
+
+        let recent = registry.recent_console_messages(1, 2).unwrap();
+
+        assert!(recent[0].message.starts_with("500 console lines were dropped"));
+        assert_eq!(recent[0].source, "system");
+        assert_eq!(recent[1].message, "after flood");
+    }
+
+    #[tokio::test]
+    async fn status_changes_are_pushed_to_subscribers() {
+        let (_directory, registry) = test_registry();
+        let mut server = sample_server_record();
+        server.status = "offline".to_string();
+        registry.upsert_server(&server).unwrap();
+
+        let mut receiver = registry.subscribe_status(server.id).unwrap();
+        // Seeded from the database for a fresh subscriber.
+        assert_eq!(receiver.borrow_and_update().as_deref(), Some("offline"));
+
+        registry
+            .set_server_runtime(server.id, "starting", None, None)
+            .unwrap();
+        receiver.changed().await.unwrap();
+        assert_eq!(receiver.borrow_and_update().as_deref(), Some("starting"));
+
+        // Deleting the server closes the channel.
+        registry.delete_server(server.id).unwrap();
+        assert!(receiver.changed().await.is_err());
+    }
+
+    #[test]
+    fn timestamps_are_formatted_in_utc() {
+        assert_eq!(format_utc_timestamp(UNIX_EPOCH), "1970-01-01 00:00:00");
+        assert_eq!(
+            format_utc_timestamp(UNIX_EPOCH + Duration::from_secs(1_709_164_800 + 3_723)),
+            "2024-02-29 01:02:03"
+        );
+    }
+
+    #[test]
+    fn legacy_console_table_is_dropped_on_initialize() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy.db");
+        let registry = ServerRegistry::new(path.clone());
+        registry.initialize().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE server_console_messages (id INTEGER PRIMARY KEY, server_id INTEGER, message TEXT);
+                 INSERT INTO server_console_messages (server_id, message) VALUES (1, 'old');",
+            )
+            .unwrap();
+        drop(connection);
+
+        registry.initialize().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'server_console_messages')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!exists);
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_fail_with_busy() {
+        let (_directory, registry) = test_registry();
+        let handles = (0..8)
+            .map(|worker| {
+                let registry = registry.clone();
+
+                std::thread::spawn(move || {
+                    for index in 0..50 {
+                        registry
+                            .set_server_runtime(worker, "running", None, Some(&index.to_string()))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 
     #[test]
     fn registry_can_upsert_and_delete_servers() {
