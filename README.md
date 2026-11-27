@@ -143,6 +143,81 @@ Be honest about what is and is not proven:
   those processes and is the next big step for very dense nodes.
 - A node is one machine. Running many nodes also depends on the panel.
 
+## Quick install (Linux)
+
+`scripts/skyport.sh` downloads, configures and manages the daemon. It asks you for everything it
+needs, so there is no file to edit by hand.
+
+Before you start:
+
+- A Linux server with systemd (x86_64, aarch64 or riscv64) and root access.
+- A node created in your Skyport panel, with its **configuration token** at hand.
+- The panel and the daemon on **the same version**.
+
+Docker is installed for you if it is missing (after asking).
+
+### Run the script on the machine
+
+Connect to the server, then download the script and start it:
+
+```bash
+curl -fsSLo skyport.sh https://raw.githubusercontent.com/skyportsh/skyportd/main/scripts/skyport.sh
+```
+
+```bash
+sudo bash skyport.sh install
+```
+
+Download it to a file as shown: piping it straight into `bash` does not work, because the script
+asks questions and installs itself as a command.
+
+If you have a local copy instead, send it to the server first (replace `user@server`):
+
+```bash
+scp scripts/skyport.sh user@server:
+```
+
+### What the installer asks
+
+| Question | Default |
+| --- | --- |
+| Install directory (binary, configuration, server files, backups) | `/var/lib/skyportd` |
+| Version to install | latest release |
+| Panel URL and configuration token | none |
+| SSL: none, new Let's Encrypt certificate, existing one, or your own files | none |
+| Log level and format, worker threads, private webhooks | `info`, `pretty`, `0`, no |
+| Start at boot | yes |
+| Open the API and SFTP ports in ufw or firewalld, if active | yes |
+
+The API and SFTP ports and the SSL setting come from the node in the panel.
+
+If you choose your own certificate files, the script links them into
+`/etc/letsencrypt/live/<domain>/`, where the daemon looks for them.
+
+If the prebuilt binary cannot run on your distribution (system libraries too old), the script
+offers to build it from source.
+
+### Manage the daemon
+
+The installer adds a `skyport` command:
+
+| Command | Effect |
+| --- | --- |
+| `sudo skyport status` | State, version, panel, ports and number of running servers |
+| `sudo skyport start` | Start the daemon |
+| `sudo skyport stop` | Stop the daemon |
+| `sudo skyport restart` | Restart the daemon |
+| `sudo skyport logs` | Follow the logs |
+| `sudo skyport update` | Update to the latest release, with rollback if it does not start |
+| `sudo skyport update v1.0.0-alpha3` | Install a given version |
+| `sudo skyport configure` | Change options, panel connection, SSL or start at boot |
+| `sudo skyport uninstall` | Remove the daemon (your data is kept unless you ask to delete it) |
+
+Stopping, restarting or updating the daemon does not stop your game servers.
+
+`skyport update` updates the daemon only. To update the command itself, download the script again
+and run `sudo bash skyport.sh install`.
+
 ## Building and running
 
 Requirements: Rust (see `rust-toolchain.toml`) and Docker.
