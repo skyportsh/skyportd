@@ -21,6 +21,9 @@ use crate::config::{DaemonConfig, managed_server_volume_path, safe_join_relative
 use crate::docker::{DockerOutput, docker_command, running_runtime_containers};
 use crate::server_registry::{ManagedServerCargo, ManagedServerRecord, ServerRegistry};
 
+/// `uid:gid` that owns the server volumes and runs the runtime containers.
+const CONTAINER_USER: &str = "1000:1000";
+
 /// Maximum number of servers preparing to start (pull, permissions, install)
 /// at the same time. Without a limit a node reboot would pull and start every
 /// server at once and saturate the disk and the network.
@@ -538,7 +541,6 @@ async fn start_runtime_container(
     tokio::fs::create_dir_all(&volume_path)
         .await
         .with_context(|| format!("failed to create {}", volume_path.display()))?;
-    fix_volume_permissions(&volume_path).await;
     ensure_server_boot_prerequisites(server, &volume_path)?;
     registry.append_console_message(server.id, "system", "Checking disk space limits...")?;
     {
@@ -583,6 +585,9 @@ async fn start_runtime_container(
     }
 
     apply_config_file_actions(registry, server, &volume_path).await?;
+    // Last write to the volume before the container starts: the files created
+    // above belong to the daemon and must be handed over to the container user.
+    fix_volume_permissions(&volume_path).await;
     remove_container(&runtime_container_name(server.id)).await?;
 
     // Release the port if a stale container from a different server is
@@ -1146,6 +1151,12 @@ fn runtime_container_run_args(
         "-i".to_string(),
         "--name".to_string(),
         runtime_container_name(server.id),
+        // Images do not agree on the uid of their user, so the volume owner is
+        // enforced. HOME is set for images that rely on their passwd entry.
+        "--user".to_string(),
+        CONTAINER_USER.to_string(),
+        "-e".to_string(),
+        "HOME=/home/container".to_string(),
         "--label".to_string(),
         format!("skyport.server_id={}", server.id),
         "-v".to_string(),
@@ -1420,19 +1431,18 @@ async fn release_port_if_occupied(port: u64) {
 }
 
 async fn fix_volume_permissions(volume_path: &Path) {
-    // On Linux, ensure the volume directory is owned by a standard container
-    // user (UID 1000) and has correct permissions so the container process
-    // can read/write files. On macOS this is a no-op since Docker Desktop
-    // handles file sharing differently.
+    // On Linux, ensure the volume is owned by the user the runtime container
+    // runs as, with permissions that let the process read and write files.
+    // On macOS this is a no-op since Docker Desktop handles file sharing
+    // differently.
     if !cfg!(target_os = "linux") {
         return;
     }
 
     let path = volume_path.to_string_lossy().to_string();
 
-    // Set ownership to UID/GID 1000 (standard container user)
     let _ = tokio::process::Command::new("chown")
-        .args(["-R", "1000:1000", &path])
+        .args(["-R", CONTAINER_USER, &path])
         .output()
         .await;
 
@@ -1774,6 +1784,28 @@ mod tests {
         assert_eq!(environment.get("SERVER_DISK"), Some(&"10240".to_string()));
         assert_eq!(environment.get("SERVER_IP"), Some(&"0.0.0.0".to_string()));
         assert_eq!(environment.get("SERVER_PORT"), Some(&"25565".to_string()));
+    }
+
+    #[test]
+    fn runtime_container_runs_as_the_volume_owner() {
+        let args = runtime_container_run_args(
+            &sample_server(),
+            Path::new("/tmp/server"),
+            "ghcr.io/example/runtime:latest",
+        );
+        let image = args
+            .iter()
+            .position(|arg| arg == "ghcr.io/example/runtime:latest")
+            .expect("image argument");
+        let user = args
+            .iter()
+            .position(|arg| arg == "--user")
+            .expect("user flag");
+
+        // Docker options placed after the image would be passed to the container.
+        assert!(user < image);
+        assert_eq!(args[user + 1], super::CONTAINER_USER);
+        assert!(args.windows(2).any(|pair| pair == ["-e", "HOME=/home/container"]));
     }
 
     #[test]
