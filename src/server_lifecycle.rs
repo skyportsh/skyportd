@@ -945,17 +945,13 @@ async fn apply_config_file_actions(
         match parser {
             "properties" => {
                 let file_path = safe_join_relative(volume_path, relative_path)?;
-                let mut replacements = BTreeMap::new();
-                if let Some(find) = rule.get("find").and_then(Value::as_object) {
-                    for (key, value) in find {
-                        replacements.insert(
-                            key.clone(),
-                            interpolate_config_value(value.as_str().unwrap_or_default(), server),
-                        );
-                    }
-                }
 
-                apply_properties_replacements(&file_path, &replacements)?;
+                apply_properties_replacements(&file_path, &config_replacements(rule, server))?;
+            }
+            "file" => {
+                let file_path = safe_join_relative(volume_path, relative_path)?;
+
+                apply_line_replacements(&file_path, &config_replacements(rule, server))?;
             }
             _ => {
                 registry.append_console_message(
@@ -969,6 +965,56 @@ async fn apply_config_file_actions(
             }
         }
     }
+
+    Ok(())
+}
+
+fn config_replacements(rule: &Value, server: &ManagedServerRecord) -> BTreeMap<String, String> {
+    rule.get("find")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                interpolate_config_value(value.as_str().unwrap_or_default(), server),
+            )
+        })
+        .collect()
+}
+
+/// Replaces every line starting with one of the keys by its value, keeping the
+/// indentation and YAML list marker. Used for YAML, TOML and other formats
+/// without a dedicated parser. A missing file is left for the server to create,
+/// and keys without a matching line are not appended.
+fn apply_line_replacements(path: &Path, replacements: &BTreeMap<String, String>) -> Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+
+    let lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            let mut content = line.trim_start();
+
+            while let Some(item) = content.strip_prefix("- ") {
+                content = item.trim_start();
+            }
+
+            replacements
+                .iter()
+                .find(|(key, _)| !key.is_empty() && content.starts_with(key.as_str()))
+                .map(|(_, value)| format!("{}{value}", &line[..line.len() - content.len()]))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect();
+
+    std::fs::write(path, lines.join("\n") + "\n")
+        .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(())
 }
@@ -1754,6 +1800,49 @@ mod tests {
 
         assert!(error.contains("within the server volume"));
         assert!(!tempdir.path().join("../../host.properties").exists());
+    }
+
+    #[tokio::test]
+    async fn file_parser_rewrites_matching_lines_and_keeps_their_prefix() {
+        let tempdir = tempdir().unwrap();
+        let registry = ServerRegistry::new(tempdir.path().join("skyportd.db"));
+        registry.initialize().unwrap();
+        let path = tempdir.path().join("config.yml");
+        std::fs::write(
+            &path,
+            "# host: comment\nlisteners:\n- query_port: 25577\n  motd: hi\n  host: 0.0.0.0:25577\n",
+        )
+        .unwrap();
+
+        let mut server = sample_server();
+        server.cargo.config_files = r#"{"config.yml":{"parser":"file","find":{"host:":"host: 0.0.0.0:{{server.build.default.port}}","query_port:":"query_port: {{server.build.default.port}}"}}}"#.to_string();
+        server.allocation.port = 25600;
+
+        apply_config_file_actions(&registry, &server, tempdir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# host: comment\nlisteners:\n- query_port: 25600\n  motd: hi\n  host: 0.0.0.0:25600\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_parser_leaves_a_missing_file_to_the_server() {
+        let tempdir = tempdir().unwrap();
+        let registry = ServerRegistry::new(tempdir.path().join("skyportd.db"));
+        registry.initialize().unwrap();
+
+        let mut server = sample_server();
+        server.cargo.config_files =
+            r#"{"config.yml":{"parser":"file","find":{"host:":"host: x"}}}"#.to_string();
+
+        apply_config_file_actions(&registry, &server, tempdir.path())
+            .await
+            .unwrap();
+
+        assert!(!tempdir.path().join("config.yml").exists());
     }
 
     #[test]
