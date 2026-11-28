@@ -799,6 +799,14 @@ async fn delete_server(
             )
         })?;
 
+    if let Err(error) = remove_runtime_and_install_containers(server_id).await {
+        warn!(
+            server_id,
+            error = %error,
+            "failed to remove containers during server deletion"
+        );
+    }
+
     forget_resource_snapshot(server_id);
 
     if deleted {
