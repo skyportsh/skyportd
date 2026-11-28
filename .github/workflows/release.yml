@@ -78,7 +78,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.os }}-v2
 
       - name: Install cross-compilation tools
         if: matrix.target != 'x86_64-unknown-linux-gnu'
