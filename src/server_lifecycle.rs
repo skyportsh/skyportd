@@ -1356,6 +1356,7 @@ async fn notify_panel_runtime_update(
         .json(&json!({
             "uuid": config.daemon.uuid,
             "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": crate::configuration::PROTOCOL_VERSION,
             "status": status,
             "last_error": last_error,
         }))

@@ -8,13 +8,14 @@ use tracing::{debug, info, warn};
 
 use crate::config::DaemonConfig;
 use crate::config::NodeSection;
-use crate::configuration;
+use crate::configuration::{self, PROTOCOL_VERSION};
 use crate::server_registry::ServerRegistry;
 
 #[derive(Serialize)]
 struct HeartbeatRequest<'a> {
     uuid: &'a str,
     version: &'static str,
+    protocol_version: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +110,7 @@ impl HeartbeatService {
             .json(&HeartbeatRequest {
                 uuid: &self.config.daemon.uuid,
                 version: env!("CARGO_PKG_VERSION"),
+                protocol_version: PROTOCOL_VERSION,
             })
             .send()
             .await?
@@ -166,12 +168,14 @@ impl HeartbeatService {
                 "{base_url}/api/daemon/servers/{server_id}/sync"
             );
 
+            let protocol_version = PROTOCOL_VERSION.to_string();
             let result = client
                 .get(&url)
                 .bearer_auth(daemon_secret)
                 .query(&[
                     ("uuid", self.config.daemon.uuid.as_str()),
                     ("version", env!("CARGO_PKG_VERSION")),
+                    ("protocol_version", protocol_version.as_str()),
                 ])
                 .timeout(std::time::Duration::from_secs(10))
                 .send()

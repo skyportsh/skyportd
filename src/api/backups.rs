@@ -16,7 +16,9 @@ pub(super) struct BackupRequest {
     backup_id: u64,
     backup_uuid: String,
     backup_name: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     uuid: String,
 }
 
@@ -28,7 +30,7 @@ pub(super) async fn handle_backup(
 ) -> std::result::Result<Json<ApiSuccessResponse>, (StatusCode, Json<ApiErrorResponse>)> {
     let config = state.config_rx.borrow().clone();
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
 
     let server = state
         .server_registry
@@ -261,7 +263,7 @@ pub(super) async fn download_backup(
     Path((_server_id, backup_uuid)): Path<(u64, String)>,
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(_query): Query<WsAuthorizationQuery>,
+    Query(query): Query<WsAuthorizationQuery>,
 ) -> std::result::Result<axum::response::Response, (StatusCode, Json<ApiErrorResponse>)> {
     use axum::body::Body;
     use axum::response::IntoResponse;
@@ -269,6 +271,7 @@ pub(super) async fn download_backup(
 
     let config = state.config_rx.borrow().clone();
     authorize_request(&config, &headers)?;
+    ensure_compatible_request(&config, &query.uuid, query.protocol_version)?;
 
     let backups_dir = project_root().map_err(internal_error)?.join("backups");
     let backup_path = backups_dir.join(format!("{backup_uuid}.tar.gz"));
@@ -345,6 +348,7 @@ pub(super) async fn notify_backup_status(
         .json(&serde_json::json!({
             "uuid": daemon_uuid,
             "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": crate::configuration::PROTOCOL_VERSION,
             "status": null,
             "backup_id": backup_id,
             "backup_status": status,

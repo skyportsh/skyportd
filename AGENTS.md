@@ -17,6 +17,7 @@ Rust node daemon for Skyport. Manages Docker containers, console/stats WebSocket
 
 The detailed rules live in `.agents/rules/`. Read the relevant file before acting:
 
+- **Protocol Versioning** - [.agents/rules/protocol-versioning.md](.agents/rules/protocol-versioning.md) - Integer `PROTOCOL_VERSION` contract, decoupled `Cargo.toml` releases, and wire compatibility checks
 - **Repo Boundaries** - [.agents/rules/repo-boundaries.md](.agents/rules/repo-boundaries.md) - Strict separation between `skyportd` and `skyportsh/installer`
 
 ## Universal Rules

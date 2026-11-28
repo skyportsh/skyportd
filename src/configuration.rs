@@ -8,6 +8,7 @@ use tracing::info;
 use crate::config::{DaemonConfig, NodeSection};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
 const ORANGE: &str = "\x1b[38;2;240;90;36m";
 const ORANGE_DARK: &str = "\x1b[38;2;217;36;0m";
 const GRAY: &str = "\x1b[38;2;120;120;120m";
@@ -19,6 +20,7 @@ struct ConfigurationRequest<'a> {
     token: &'a str,
     uuid: &'a str,
     version: &'static str,
+    protocol_version: u32,
     hostname: String,
     reported_ip: Option<String>,
     os: &'static str,
@@ -49,6 +51,7 @@ struct ConfigurationResponse {
     node_id: u64,
     panel_time: String,
     panel_version: String,
+    protocol_version: u32,
     task_poll_interval_seconds: u64,
 }
 
@@ -83,7 +86,7 @@ pub async fn ensure_configured(mut config: DaemonConfig) -> Result<DaemonConfig>
 
         match enroll_with_panel(&config).await {
             Ok(payload) => {
-                ensure_compatible_panel_version(&payload.panel_version)?;
+                ensure_compatible_panel_protocol(payload.protocol_version)?;
 
                 config.persist_configuration(
                     payload.node_id,
@@ -109,6 +112,7 @@ pub async fn ensure_configured(mut config: DaemonConfig) -> Result<DaemonConfig>
                     task_poll_interval_seconds = payload.task_poll_interval_seconds,
                     panel_time = %payload.panel_time,
                     panel_version = %payload.panel_version,
+                    panel_protocol = payload.protocol_version,
                     "daemon configuration completed"
                 );
 
@@ -216,6 +220,7 @@ async fn enroll_with_panel(
         token: configuration_token,
         uuid: &config.daemon.uuid,
         version: CURRENT_VERSION,
+        protocol_version: PROTOCOL_VERSION,
         hostname: hostname::get()
             .context("failed to resolve hostname")
             .map_err(EnrollmentFailure::Fatal)?
@@ -272,16 +277,16 @@ async fn enroll_with_panel(
     Ok(payload)
 }
 
-fn ensure_compatible_panel_version(panel_version: &str) -> Result<()> {
-    if panel_version == CURRENT_VERSION {
+fn ensure_compatible_panel_protocol(panel_protocol_version: u32) -> Result<()> {
+    if panel_protocol_version == PROTOCOL_VERSION {
         return Ok(());
     }
 
-    bail!(incompatible_panel_message(panel_version));
+    bail!(incompatible_panel_message(panel_protocol_version));
 }
 
-fn incompatible_panel_message(panel_version: &str) -> String {
-    format!("This version of skyportd isn't compatible with Skyport panel {panel_version}.")
+fn incompatible_panel_message(panel_protocol_version: u32) -> String {
+    format!("This version of skyportd isn't compatible with Skyport panel protocol v{panel_protocol_version}.")
 }
 
 fn is_compatibility_error_message(message: &str) -> bool {
@@ -631,23 +636,26 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_check_requires_matching_versions() {
-        assert!(ensure_compatible_panel_version(CURRENT_VERSION).is_ok());
+    fn compatibility_check_requires_matching_protocol_versions() {
+        assert!(ensure_compatible_panel_protocol(PROTOCOL_VERSION).is_ok());
 
-        let error = ensure_compatible_panel_version("9.9.9")
-            .expect_err("mismatched versions should fail")
+        let error = ensure_compatible_panel_protocol(PROTOCOL_VERSION + 1)
+            .expect_err("mismatched protocol versions should fail")
             .to_string();
 
         assert_eq!(
             error,
-            "This version of skyportd isn't compatible with Skyport panel 9.9.9."
+            format!(
+                "This version of skyportd isn't compatible with Skyport panel protocol v{}.",
+                PROTOCOL_VERSION + 1
+            )
         );
     }
 
     #[test]
     fn detects_compatibility_messages() {
         assert!(is_compatibility_error_message(&format!(
-            "This version of skyportd isn't compatible with Skyport panel {CURRENT_VERSION}."
+            "This version of skyportd isn't compatible with Skyport panel protocol v{PROTOCOL_VERSION}."
         )));
         assert!(!is_compatibility_error_message(
             "The enrollment token is invalid."

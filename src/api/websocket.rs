@@ -27,7 +27,7 @@ pub(super) async fn server_ws(
 ) -> std::result::Result<Response, (StatusCode, Json<ApiErrorResponse>)> {
     let config = state.config_rx.borrow().clone();
 
-    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    ensure_compatible_request(&config, &query.uuid, query.protocol_version)?;
     load_managed_server(&state.server_registry, &config, server_id)?;
 
     Ok(ws.on_upgrade(move |socket| {
@@ -37,7 +37,7 @@ pub(super) async fn server_ws(
             server_id,
             config.panel.daemon_callback_token,
             query.uuid,
-            query.panel_version,
+            query.protocol_version,
         )
     }))
 }
@@ -48,7 +48,7 @@ pub(super) async fn handle_server_ws(
     server_id: u64,
     expected_token: Option<String>,
     request_uuid: String,
-    request_panel_version: String,
+    request_protocol_version: u32,
 ) {
     let mut authenticated = false;
     let mut token_permissions: Vec<String> = Vec::new();
@@ -172,7 +172,7 @@ pub(super) async fn handle_server_ws(
                                 &event,
                                 server_id,
                                 &request_uuid,
-                                &request_panel_version,
+                                request_protocol_version,
                             ) {
                                 Ok(payload) => {
                                     authenticated = true;
@@ -356,7 +356,7 @@ pub fn authenticate_ws_event(
     event: &WsClientEvent,
     server_id: u64,
     request_uuid: &str,
-    request_panel_version: &str,
+    request_protocol_version: u32,
 ) -> Result<WsTokenPayload> {
     let secret = expected_token
         .filter(|token| !token.is_empty())
@@ -393,8 +393,8 @@ pub fn authenticate_ws_event(
         bail!("The websocket token daemon identity is invalid.");
     }
 
-    if payload.panel_version != request_panel_version {
-        bail!("The websocket token panel version is invalid.");
+    if payload.protocol_version != request_protocol_version {
+        bail!("The websocket token protocol version is invalid.");
     }
 
     let now = SystemTime::now()

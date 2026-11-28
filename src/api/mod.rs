@@ -41,7 +41,7 @@ use crate::server_registry::{
     ManagedServerRecord, ManagedServerUser, ManagedServerVariable, ServerRegistry,
 };
 
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::configuration::PROTOCOL_VERSION;
 
 #[derive(Clone)]
 struct ApiState {
@@ -53,7 +53,9 @@ struct ApiState {
 #[derive(Debug, Deserialize)]
 struct ConfigurationSyncRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     name: String,
     fqdn: String,
     daemon_port: u16,
@@ -67,40 +69,52 @@ struct ConfigurationSyncRequest {
 #[derive(Debug, Deserialize)]
 struct ServerSyncRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     server: ServerPayload,
 }
 
 #[derive(Debug, Deserialize)]
 struct ServerDeleteRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
 }
 
 #[derive(Debug, Deserialize)]
 struct ServerPowerRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     signal: PowerSignal,
 }
 
 #[derive(Debug, Deserialize)]
 struct WsAuthorizationQuery {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
 }
 
 #[derive(Debug, Deserialize)]
 struct ServerFilesystemQuery {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ServerFileContentsRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     path: String,
     contents: String,
 }
@@ -108,7 +122,9 @@ struct ServerFileContentsRequest {
 #[derive(Debug, Deserialize)]
 struct ServerCreateFilesystemEntryRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     path: String,
     name: String,
 }
@@ -116,14 +132,18 @@ struct ServerCreateFilesystemEntryRequest {
 #[derive(Debug, Deserialize)]
 struct ServerDeleteFilesRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ServerRenameFilesystemEntryRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     path: String,
     name: String,
 }
@@ -131,7 +151,9 @@ struct ServerRenameFilesystemEntryRequest {
 #[derive(Debug, Deserialize)]
 struct ServerTransferFilesRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     paths: Vec<String>,
     destination: String,
 }
@@ -139,7 +161,9 @@ struct ServerTransferFilesRequest {
 #[derive(Debug, Deserialize)]
 struct ServerUpdatePermissionsRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     paths: Vec<String>,
     permissions: String,
 }
@@ -147,7 +171,9 @@ struct ServerUpdatePermissionsRequest {
 #[derive(Debug, Deserialize)]
 struct ServerArchiveFilesRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     paths: Vec<String>,
     path: String,
     name: String,
@@ -156,7 +182,9 @@ struct ServerArchiveFilesRequest {
 #[derive(Debug, Deserialize)]
 struct ServerExtractArchiveRequest {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     path: String,
     destination: Option<String>,
 }
@@ -164,7 +192,9 @@ struct ServerExtractArchiveRequest {
 #[derive(Debug, Deserialize)]
 struct ServerUploadFileQuery {
     uuid: String,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     path: Option<String>,
     name: String,
 }
@@ -212,7 +242,9 @@ struct WsClientEvent {
 pub(super) struct WsTokenPayload {
     daemon_uuid: String,
     exp: u64,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     #[serde(default)]
     permissions: Vec<String>,
     server_id: u64,
@@ -589,7 +621,7 @@ async fn sync_configuration(
     let mut config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
 
     let tls_cert_path = config
         .node
@@ -638,7 +670,7 @@ async fn sync_server(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
 
     let configured_node_id = config.panel.node_id.ok_or_else(|| {
         error_response(
@@ -787,7 +819,7 @@ async fn delete_server(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
 
     let deleted = state
         .server_registry
@@ -830,7 +862,7 @@ async fn list_server_files(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    ensure_compatible_request(&config, &query.uuid, query.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let requested_path = query.path.unwrap_or_default();
 
@@ -852,7 +884,7 @@ async fn read_server_file(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    ensure_compatible_request(&config, &query.uuid, query.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let requested_path = query.path.unwrap_or_default();
 
@@ -875,7 +907,7 @@ async fn write_server_file(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
     tokio::task::spawn_blocking(move || write_text_file(&server, &payload.path, &payload.contents))
@@ -900,7 +932,7 @@ async fn create_server_file(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
     tokio::task::spawn_blocking(move || create_file(&server, &payload.path, &payload.name))
@@ -925,7 +957,7 @@ async fn create_server_directory(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
     tokio::task::spawn_blocking(move || create_directory(&server, &payload.path, &payload.name))
@@ -950,7 +982,7 @@ async fn delete_server_files(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let deleted_count = payload.paths.len();
 
@@ -980,7 +1012,7 @@ async fn rename_server_file(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
     tokio::task::spawn_blocking(move || {
@@ -1007,7 +1039,7 @@ async fn move_server_files(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let moved_count = payload.paths.len();
 
@@ -1037,7 +1069,7 @@ async fn copy_server_files(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let copied_count = payload.paths.len();
 
@@ -1067,7 +1099,7 @@ async fn update_server_file_permissions(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
     tokio::task::spawn_blocking(move || {
@@ -1094,7 +1126,7 @@ async fn create_server_archive(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
 
     tokio::task::spawn_blocking(move || {
@@ -1121,7 +1153,7 @@ async fn extract_server_archive(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let destination = payload.destination.unwrap_or_default();
 
@@ -1151,7 +1183,7 @@ async fn upload_server_file(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    ensure_compatible_request(&config, &query.uuid, query.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let target_path = query.path.unwrap_or_default();
     let file_name = query.name;
@@ -1241,7 +1273,9 @@ async fn stream_body_to_file(
 struct TransferRequest {
     action: String,
     transfer_id: u64,
+    #[allow(dead_code)]
     panel_version: String,
+    protocol_version: u32,
     uuid: String,
 }
 
@@ -1253,7 +1287,7 @@ async fn handle_transfer(
 ) -> std::result::Result<Json<ApiSuccessResponse>, (StatusCode, Json<ApiErrorResponse>)> {
     let config = state.config_rx.borrow().clone();
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
 
     let _server = state
         .server_registry
@@ -1363,6 +1397,7 @@ async fn notify_transfer_status(
         .json(&serde_json::json!({
             "uuid": config.daemon.uuid,
             "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": PROTOCOL_VERSION,
             "status": null,
             "transfer_id": transfer_id,
             "transfer_status": status,
@@ -1386,7 +1421,7 @@ async fn power_server(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &payload.uuid, &payload.panel_version)?;
+    ensure_compatible_request(&config, &payload.uuid, payload.protocol_version)?;
 
     let mut server = load_managed_server(&state.server_registry, &config, server_id)?;
 
@@ -1410,7 +1445,7 @@ async fn download_install_log(
     let config = state.config_rx.borrow().clone();
 
     authorize_request(&config, &headers)?;
-    ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
+    ensure_compatible_request(&config, &query.uuid, query.protocol_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
     let volume_path = resolve_volume_path(&server).map_err(internal_error)?;
     let file = crate::volume_fs::open(
@@ -2080,14 +2115,13 @@ pub(super) fn load_managed_server(
 pub(super) fn ensure_compatible_request(
     config: &DaemonConfig,
     request_uuid: &str,
-    panel_version: &str,
+    panel_protocol_version: u32,
 ) -> std::result::Result<(), (StatusCode, Json<ApiErrorResponse>)> {
-    if panel_version != CURRENT_VERSION {
+    if panel_protocol_version != PROTOCOL_VERSION {
         return Err(error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
-                "This version of skyportd isn't compatible with Skyport panel {}.",
-                panel_version
+                "This version of skyportd isn't compatible with Skyport panel protocol v{panel_protocol_version}."
             ),
         ));
     }
@@ -2268,8 +2302,9 @@ mod tests {
         let payload = WsTokenPayload {
             daemon_uuid: config.daemon.uuid.clone(),
             exp: current_unix_timestamp() + 600,
-            panel_version: CURRENT_VERSION.to_string(),
+            panel_version: "1.0.0-alpha2".to_string(),
             permissions: vec!["*".to_string()],
+            protocol_version: PROTOCOL_VERSION,
             server_id,
         };
         let payload_hex = hex_encode(serde_json::to_string(&payload).unwrap().as_bytes());
@@ -2343,7 +2378,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
         let url = format!(
-            "ws://{address}/api/daemon/servers/{}/ws?uuid={}&panel_version={CURRENT_VERSION}",
+            "ws://{address}/api/daemon/servers/{}/ws?uuid={}&panel_version=1.0.0-alpha2&protocol_version={PROTOCOL_VERSION}",
             server.id, config.daemon.uuid
         );
         let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
@@ -3125,8 +3160,9 @@ public class Run {
             serde_json::to_string(&WsTokenPayload {
                 daemon_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 exp: current_unix_timestamp() + 60,
-                panel_version: CURRENT_VERSION.to_string(),
+                panel_version: "1.0.0-alpha2".to_string(),
                 permissions: vec!["console".to_string()],
+                protocol_version: PROTOCOL_VERSION,
                 server_id: 42,
             })
             .expect("token payload json")
@@ -3150,7 +3186,7 @@ public class Run {
                 &event,
                 42,
                 "550e8400-e29b-41d4-a716-446655440000",
-                CURRENT_VERSION,
+                PROTOCOL_VERSION,
             )
             .is_ok()
         );
@@ -3160,7 +3196,17 @@ public class Run {
                 &event,
                 42,
                 "550e8400-e29b-41d4-a716-446655440000",
-                CURRENT_VERSION,
+                PROTOCOL_VERSION,
+            )
+            .is_err()
+        );
+        assert!(
+            authenticate_ws_event(
+                Some("callback-token"),
+                &event,
+                42,
+                "550e8400-e29b-41d4-a716-446655440000",
+                PROTOCOL_VERSION + 1,
             )
             .is_err()
         );
@@ -3393,6 +3439,28 @@ public class Run {
                 definition: Value::Null,
             },
         }
+    }
+
+    #[test]
+    fn ensure_compatible_request_validates_protocol_version_and_uuid() {
+        let config = ws_test_config(1);
+
+        assert!(ensure_compatible_request(&config, &config.daemon.uuid, PROTOCOL_VERSION).is_ok());
+
+        let (status, body) = ensure_compatible_request(&config, &config.daemon.uuid, PROTOCOL_VERSION + 1)
+            .expect_err("mismatched protocol version should fail");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body.0.message,
+            format!(
+                "This version of skyportd isn't compatible with Skyport panel protocol v{}.",
+                PROTOCOL_VERSION + 1
+            )
+        );
+
+        let (status, _) = ensure_compatible_request(&config, "wrong-uuid", PROTOCOL_VERSION)
+            .expect_err("mismatched uuid should fail");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     fn expect_json(actual: &str, expected: Value) {
