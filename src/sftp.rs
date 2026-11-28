@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{DaemonConfig, managed_server_volume_path};
+use crate::volume_fs::{self, OpenMode};
 
 #[derive(Debug, Deserialize)]
 struct SftpAuthResponse {
@@ -462,25 +463,21 @@ impl Handler for SftpSession {
 
                 match self.resolve_path(path_str) {
                     Ok(path) => {
-                        let mut opts = tokio::fs::OpenOptions::new();
+                        let mode = OpenMode {
+                            read: pflags & 0x01 != 0,
+                            write: pflags & 0x02 != 0,
+                            append: pflags & 0x04 != 0,
+                            create: pflags & 0x08 != 0,
+                            truncate: pflags & 0x10 != 0,
+                            create_parents: false,
+                        };
+                        let opened = self.volume_path().and_then(|volume| {
+                            let relative = path.strip_prefix(&volume)?;
 
-                        if pflags & 0x01 != 0 {
-                            opts.read(true);
-                        }
-                        if pflags & 0x02 != 0 {
-                            opts.write(true);
-                        }
-                        if pflags & 0x08 != 0 {
-                            opts.create(true);
-                        }
-                        if pflags & 0x10 != 0 {
-                            opts.truncate(true);
-                        }
-                        if pflags & 0x04 != 0 {
-                            opts.append(true);
-                        }
+                            Ok(volume_fs::open(&volume, relative, mode)?)
+                        });
 
-                        match opts.open(&path).await {
+                        match opened.map(tokio::fs::File::from_std) {
                             Ok(file) => {
                                 let h = self
                                     .alloc_handle(SftpHandle::File { file, path })

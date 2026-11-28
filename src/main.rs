@@ -9,6 +9,7 @@ mod server_lifecycle;
 mod server_registry;
 mod service;
 mod sftp;
+mod volume_fs;
 mod workflow;
 mod shutdown;
 

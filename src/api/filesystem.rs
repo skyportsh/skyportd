@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as StdPath, PathBuf};
@@ -12,6 +13,7 @@ use super::{
 };
 use crate::config::safe_join_relative;
 use crate::server_registry::ManagedServerRecord;
+use crate::volume_fs::{self, OpenMode};
 
 pub(super) fn list_directory(
     server: &ManagedServerRecord,
@@ -69,8 +71,10 @@ pub(super) fn read_text_file(
         bail!("This file is too large to open in the editor.");
     }
 
-    let bytes =
-        fs::read(&file_path).with_context(|| format!("failed to read {}", file_path.display()))?;
+    let mut bytes = Vec::new();
+    open_resolved(&volume_path, &file_path, OpenMode::read())
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .with_context(|| format!("failed to read {}", file_path.display()))?;
 
     if bytes.contains(&0) {
         bail!("This file could not be opened as text.");
@@ -109,10 +113,21 @@ pub(super) fn write_text_file(
         bail!("The requested path is not a file.");
     }
 
-    fs::write(&file_path, contents)
+    open_resolved(&volume_path, &file_path, OpenMode::overwrite())
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
         .with_context(|| format!("failed to write {}", file_path.display()))?;
 
     Ok(())
+}
+
+/// Opens an already resolved path, refusing any link that appeared since (or
+/// that could not be resolved because its target does not exist).
+fn open_resolved(volume_path: &StdPath, path: &StdPath, mode: OpenMode) -> std::io::Result<fs::File> {
+    let relative = path
+        .strip_prefix(volume_path)
+        .map_err(std::io::Error::other)?;
+
+    volume_fs::open(volume_path, relative, mode)
 }
 
 pub(super) fn create_file(

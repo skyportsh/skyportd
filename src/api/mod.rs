@@ -1412,11 +1412,14 @@ async fn download_install_log(
     authorize_request(&config, &headers)?;
     ensure_compatible_request(&config, &query.uuid, &query.panel_version)?;
     let server = load_managed_server(&state.server_registry, &config, server_id)?;
-    let path = resolve_volume_path(&server)
-        .map_err(internal_error)?
-        .join("install.log");
-
-    let file = tokio::fs::File::open(&path).await.map_err(|error| {
+    let volume_path = resolve_volume_path(&server).map_err(internal_error)?;
+    let file = crate::volume_fs::open(
+        &volume_path,
+        StdPath::new("install.log"),
+        crate::volume_fs::OpenMode::read(),
+    )
+    .map(tokio::fs::File::from_std)
+    .map_err(|error| {
         error_response(
             StatusCode::NOT_FOUND,
             format!("failed to read install log: {error}"),

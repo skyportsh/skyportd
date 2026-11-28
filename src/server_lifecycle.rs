@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
@@ -20,9 +19,13 @@ use tracing::{info, warn};
 use crate::config::{DaemonConfig, managed_server_volume_path, safe_join_relative};
 use crate::docker::{DockerOutput, docker_command, running_runtime_containers};
 use crate::server_registry::{ManagedServerCargo, ManagedServerRecord, ServerRegistry};
+use crate::volume_fs::{self, OpenMode};
 
 /// `uid:gid` that owns the server volumes and runs the runtime containers.
 const CONTAINER_USER: &str = "1000:1000";
+const CONTAINER_PIDS_LIMIT: u32 = 4096;
+const MIN_INSTALL_MEMORY_MIB: u64 = 2048;
+const INSTALL_LOG: &str = "install.log";
 
 /// Maximum number of servers preparing to start (pull, permissions, install)
 /// at the same time. Without a limit a node reboot would pull and start every
@@ -350,12 +353,11 @@ async fn provision_and_install(
         .await
         .with_context(|| format!("failed to create {}", volume_path.display()))?;
 
-    let install_log_path = volume_path.join("install.log");
-    reset_install_log(&install_log_path)?;
+    reset_install_log(&volume_path)?;
 
     set_runtime_state(registry, config, server.id, "installing", None, None).await?;
     registry.append_console_message(server.id, "system", "Preparing volume directory...")?;
-    append_install_log(&install_log_path, "system", "Preparing volume directory...")?;
+    append_install_log(&volume_path, "system", "Preparing volume directory...")?;
 
     let install_script = normalize_shell_script(
         server
@@ -379,7 +381,7 @@ async fn provision_and_install(
             "No install container configured. Skipping installation.",
         )?;
         append_install_log(
-            &install_log_path,
+            &volume_path,
             "system",
             "No install container configured. Skipping installation.",
         )?;
@@ -395,7 +397,7 @@ async fn provision_and_install(
         &format!("Running install container {install_image}..."),
     )?;
     append_install_log(
-        &install_log_path,
+        &volume_path,
         "system",
         &format!("Running install container {install_image}..."),
     )?;
@@ -421,18 +423,9 @@ async fn provision_and_install(
     // should never require full host access during normal operation.
     if server.cargo.requires_privileged {
         command.arg("--privileged");
-    } else {
-        command
-            .arg("--security-opt")
-            .arg("seccomp=unconfined")
-            .arg("--cap-drop=ALL")
-            .arg("--cap-add=CHOWN")
-            .arg("--cap-add=DAC_OVERRIDE")
-            .arg("--cap-add=NET_ADMIN")
-            .arg("--cap-add=SYS_PTRACE")
-            .arg("--cap-add=SETUID")
-            .arg("--cap-add=SETGID");
     }
+
+    command.args(install_container_limit_args(server));
 
     command
         .arg("-v")
@@ -458,7 +451,7 @@ async fn provision_and_install(
         server.id,
         "install",
         cancellation,
-        Some(&install_log_path),
+        Some(&volume_path),
     )
     .await?;
     // `boot_server` below takes its own slot.
@@ -468,7 +461,7 @@ async fn provision_and_install(
         let code = status.code().unwrap_or_default();
         let message = format!("Installation failed with exit code {code}.");
         registry.append_console_message(server.id, "system", &message)?;
-        append_install_log(&install_log_path, "system", &message)?;
+        append_install_log(&volume_path, "system", &message)?;
         set_runtime_state(
             registry,
             config,
@@ -483,7 +476,7 @@ async fn provision_and_install(
 
     registry.append_console_message(server.id, "system", "Installation completed successfully.")?;
     append_install_log(
-        &install_log_path,
+        &volume_path,
         "system",
         "Installation completed successfully.",
     )?;
@@ -944,14 +937,18 @@ async fn apply_config_file_actions(
 
         match parser {
             "properties" => {
-                let file_path = safe_join_relative(volume_path, relative_path)?;
-
-                apply_properties_replacements(&file_path, &config_replacements(rule, server))?;
+                apply_properties_replacements(
+                    volume_path,
+                    relative_path,
+                    &config_replacements(rule, server),
+                )?;
             }
             "file" => {
-                let file_path = safe_join_relative(volume_path, relative_path)?;
-
-                apply_line_replacements(&file_path, &config_replacements(rule, server))?;
+                apply_line_replacements(
+                    volume_path,
+                    relative_path,
+                    &config_replacements(rule, server),
+                )?;
             }
             _ => {
                 registry.append_console_message(
@@ -987,13 +984,14 @@ fn config_replacements(rule: &Value, server: &ManagedServerRecord) -> BTreeMap<S
 /// indentation and YAML list marker. Used for YAML, TOML and other formats
 /// without a dedicated parser. A missing file is left for the server to create,
 /// and keys without a matching line are not appended.
-fn apply_line_replacements(path: &Path, replacements: &BTreeMap<String, String>) -> Result<()> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
-        }
+fn apply_line_replacements(
+    volume_path: &Path,
+    relative_path: &str,
+    replacements: &BTreeMap<String, String>,
+) -> Result<()> {
+    let path = safe_join_relative(volume_path, relative_path)?;
+    let Some(existing) = read_volume_file(volume_path, relative_path)? else {
+        return Ok(());
     };
 
     let lines: Vec<String> = existing
@@ -1013,17 +1011,16 @@ fn apply_line_replacements(path: &Path, replacements: &BTreeMap<String, String>)
         })
         .collect();
 
-    std::fs::write(path, lines.join("\n") + "\n")
-        .with_context(|| format!("failed to write {}", path.display()))?;
-
-    Ok(())
+    write_volume_file(volume_path, &path, relative_path, &(lines.join("\n") + "\n"))
 }
 
 fn apply_properties_replacements(
-    path: &Path,
+    volume_path: &Path,
+    relative_path: &str,
     replacements: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let path = safe_join_relative(volume_path, relative_path)?;
+    let existing = read_volume_file(volume_path, relative_path)?.unwrap_or_default();
     let mut lines: Vec<String> = if existing.is_empty() {
         Vec::new()
     } else {
@@ -1053,15 +1050,41 @@ fn apply_properties_replacements(
         }
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
+    write_volume_file(volume_path, &path, relative_path, &(lines.join("\n") + "\n"))
+}
 
-    std::fs::write(path, lines.join("\n") + "\n")
-        .with_context(|| format!("failed to write {}", path.display()))?;
+/// Reads a text file of a server volume, `None` when it does not exist.
+fn read_volume_file(volume_path: &Path, relative_path: &str) -> Result<Option<String>> {
+    let mut file = match volume_fs::open(volume_path, Path::new(relative_path), OpenMode::read()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {relative_path} (symlinks are refused)"));
+        }
+    };
 
-    Ok(())
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("failed to read {relative_path}"))?;
+
+    Ok(Some(contents))
+}
+
+fn write_volume_file(
+    volume_path: &Path,
+    path: &Path,
+    relative_path: &str,
+    contents: &str,
+) -> Result<()> {
+    let mode = OpenMode {
+        create_parents: true,
+        ..OpenMode::overwrite()
+    };
+
+    volume_fs::open(volume_path, Path::new(relative_path), mode)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .with_context(|| format!("failed to write {} (symlinks are refused)", path.display()))
 }
 
 fn interpolate_config_value(value: &str, server: &ManagedServerRecord) -> String {
@@ -1142,7 +1165,12 @@ fn cargo_has_feature(cargo: &ManagedServerCargo, feature: &str) -> bool {
 }
 
 fn write_eula_file(volume_path: &Path) -> Result<()> {
-    std::fs::write(volume_path.join("eula.txt"), "eula=true\n").context("failed to write eula.txt")
+    write_volume_file(
+        volume_path,
+        &volume_path.join("eula.txt"),
+        "eula.txt",
+        "eula=true\n",
+    )
 }
 
 fn default_environment(cargo: &ManagedServerCargo) -> BTreeMap<String, String> {
@@ -1209,11 +1237,14 @@ fn runtime_container_run_args(
         format!("{}:/home/container", volume_path.display()),
         "-w".to_string(),
         "/home/container".to_string(),
+        "--cap-drop=ALL".to_string(),
+        "--security-opt=no-new-privileges".to_string(),
+        format!("--pids-limit={CONTAINER_PIDS_LIMIT}"),
+        // Docker publishes TCP only unless told otherwise, and many games use UDP.
         "-p".to_string(),
-        format!(
-            "{}:{}:{}",
-            server.allocation.bind_ip, server.allocation.port, server.allocation.port
-        ),
+        published_port(server, "tcp"),
+        "-p".to_string(),
+        published_port(server, "udp"),
         "--memory".to_string(),
         format!("{}m", server.limits.memory_mib),
     ];
@@ -1233,23 +1264,60 @@ fn runtime_container_run_args(
     args
 }
 
+fn published_port(server: &ManagedServerRecord, protocol: &str) -> String {
+    let allocation = &server.allocation;
+
+    format!(
+        "{}:{}:{}/{protocol}",
+        allocation.bind_ip, allocation.port, allocation.port
+    )
+}
+
+/// Restrictions of the install container. It runs as root to install packages,
+/// so it keeps only what `apt` and file ownership changes require.
+fn install_container_limit_args(server: &ManagedServerRecord) -> Vec<String> {
+    let memory_mib = server.limits.memory_mib.max(MIN_INSTALL_MEMORY_MIB);
+    let mut args = vec![
+        format!("--pids-limit={CONTAINER_PIDS_LIMIT}"),
+        format!("--memory={memory_mib}m"),
+    ];
+
+    if !server.cargo.requires_privileged {
+        args.push("--cap-drop=ALL".to_string());
+        // FOWNER: apt chmods files it has already handed to the `_apt` user.
+        args.extend(
+            ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+                .map(|capability| format!("--cap-add={capability}")),
+        );
+    }
+
+    args
+}
+
 fn normalize_shell_script(script: &str) -> String {
     script.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn reset_install_log(path: &Path) -> Result<()> {
-    std::fs::write(path, "").with_context(|| format!("failed to reset {}", path.display()))
+fn reset_install_log(volume_path: &Path) -> Result<()> {
+    let path = volume_path.join(INSTALL_LOG);
+
+    // A link left behind by the server is removed, never followed.
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+
+    write_volume_file(volume_path, &path, INSTALL_LOG, "")
 }
 
-fn append_install_log(path: &Path, source: &str, message: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+fn append_install_log(volume_path: &Path, source: &str, message: &str) -> Result<()> {
+    let mut file = volume_fs::open(volume_path, Path::new(INSTALL_LOG), OpenMode::append())
+        .context("failed to open the install log")?;
 
-    writeln!(file, "[{source}] {message}")
-        .with_context(|| format!("failed to write {}", path.display()))
+    writeln!(file, "[{source}] {message}").context("failed to write the install log")
 }
 
 async fn set_runtime_state(
@@ -1594,7 +1662,7 @@ async fn run_streaming_command(
     server_id: u64,
     source: &str,
     cancellation: &CancellationToken,
-    install_log_path: Option<&Path>,
+    install_log_volume: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().context("failed to spawn docker command")?;
@@ -1613,8 +1681,8 @@ async fn run_streaming_command(
                 match line.context("failed to read command stdout")? {
                     Some(line) => {
                         registry.append_console_message(server_id, source, &line)?;
-                        if let Some(install_log_path) = install_log_path {
-                            append_install_log(install_log_path, source, &line)?;
+                        if let Some(volume_path) = install_log_volume {
+                            append_install_log(volume_path, source, &line)?;
                         }
                     }
                     None => break,
@@ -1623,8 +1691,8 @@ async fn run_streaming_command(
             line = stderr_lines.next_line() => {
                 if let Some(line) = line.context("failed to read command stderr")? {
                     registry.append_console_message(server_id, source, &line)?;
-                    if let Some(install_log_path) = install_log_path {
-                        append_install_log(install_log_path, source, &line)?;
+                    if let Some(volume_path) = install_log_volume {
+                        append_install_log(volume_path, source, &line)?;
                     }
                 }
             }
@@ -1775,7 +1843,8 @@ mod tests {
             ("server-port".to_string(), "25565".to_string()),
         ]);
 
-        apply_properties_replacements(&file, &replacements).unwrap();
+        apply_properties_replacements(tempdir.path(), "server.properties", &replacements)
+            .unwrap();
 
         let contents = std::fs::read_to_string(file).unwrap();
         assert!(contents.contains("server-ip=0.0.0.0"));
@@ -1914,6 +1983,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_container_publishes_tcp_and_udp_with_restrictions() {
+        let server = sample_server();
+        let args = runtime_container_run_args(&server, Path::new("/tmp/server"), "image");
+        let port = server.allocation.port;
+        let address = format!("{}:{port}:{port}", server.allocation.bind_ip);
+
+        for protocol in ["tcp", "udp"] {
+            let published = format!("{address}/{protocol}");
+            assert!(args.windows(2).any(|pair| pair[0] == "-p" && pair[1] == published));
+        }
+        assert!(args.contains(&"--cap-drop=ALL".to_string()));
+        assert!(args.contains(&"--security-opt=no-new-privileges".to_string()));
+    }
+
+    #[test]
+    fn install_container_keeps_only_the_capabilities_apt_needs() {
+        let mut server = sample_server();
+        server.limits.memory_mib = 512;
+
+        let args = super::install_container_limit_args(&server);
+
+        assert!(args.contains(&"--cap-add=FOWNER".to_string()));
+        assert!(args.contains(&"--memory=2048m".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("NET_ADMIN")
+            || arg.contains("SYS_PTRACE")
+            || arg.contains("unconfined")));
+
+        server.cargo.requires_privileged = true;
+        let privileged = super::install_container_limit_args(&server);
+        assert!(!privileged.iter().any(|arg| arg.starts_with("--cap-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_writes_never_follow_links_planted_in_the_volume() {
+        use std::os::unix::fs::symlink;
+
+        let volume = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("host-file");
+        std::fs::write(&target, "host").unwrap();
+        for name in ["eula.txt", "server.properties", "config.yml", "install.log"] {
+            symlink(&target, volume.path().join(name)).unwrap();
+        }
+        let replacements = BTreeMap::from([("host".to_string(), "changed".to_string())]);
+
+        super::write_eula_file(volume.path()).expect_err("eula link");
+        apply_properties_replacements(volume.path(), "server.properties", &replacements)
+            .expect_err("properties link");
+        super::apply_line_replacements(volume.path(), "config.yml", &replacements)
+            .expect_err("config link");
+        append_install_log(volume.path(), "system", "line").expect_err("log link");
+        reset_install_log(volume.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "host");
+    }
+
     fn sample_server() -> ManagedServerRecord {
         ManagedServerRecord {
             id: 1,
@@ -2041,9 +2168,9 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let log_path = tempdir.path().join("install.log");
 
-        reset_install_log(&log_path).unwrap();
-        append_install_log(&log_path, "system", "Preparing volume directory...").unwrap();
-        append_install_log(&log_path, "install", "Downloading files...").unwrap();
+        reset_install_log(tempdir.path()).unwrap();
+        append_install_log(tempdir.path(), "system", "Preparing volume directory...").unwrap();
+        append_install_log(tempdir.path(), "install", "Downloading files...").unwrap();
 
         let contents = std::fs::read_to_string(log_path).unwrap();
         assert!(contents.contains("[system] Preparing volume directory..."));
